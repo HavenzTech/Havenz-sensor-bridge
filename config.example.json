@@ -1,0 +1,21 @@
+{
+  "api_url": "https://havenz-backend-599129251048.us-central1.run.app",
+  "ingest_path": "/api/iot/ingest",
+  "secret": "PUT-THE-SAME-SECRET-AS-IotIngest:Secret-ON-THE-BACKEND",
+  "poll_interval_seconds": 30,
+
+  "home_assistant": {
+    "url": "http://localhost:8123",
+    "token": "PUT-A-HOME-ASSISTANT-LONG-LIVED-ACCESS-TOKEN-HERE"
+  },
+
+  "_comment": "Each mapping ties one Home Assistant entity to one Havenz device + metric. device_key must match a registered BmsDevice's Name, SerialNumber, or MacAddress. Add a line per sensor — no code changes.",
+  "mappings": [
+    { "entity": "sensor.living_room_temperature", "device_key": "Living Room Temp", "metric_type": "temperature", "unit": "°C" },
+    { "entity": "sensor.living_room_humidity",     "device_key": "Living Room Temp", "metric_type": "humidity",    "unit": "%" },
+    { "entity": "binary_sensor.pump_room_leak",    "device_key": "Pump Room Leak",   "metric_type": "water_detection" },
+    { "entity": "sensor.air_quality_pm25",         "device_key": "Office Air",       "metric_type": "air_quality_pm25", "unit": "µg/m³", "thresholdMax": 35 },
+    { "entity": "sensor.shelly_plug_power",        "device_key": "Server Plug",      "metric_type": "power_consumption", "unit": "W" },
+    { "entity": "sensor.shelly_plug_energy",       "device_key": "Server Plug",      "metric_type": "energy_usage",      "unit": "kWh" }
+  ]
+}

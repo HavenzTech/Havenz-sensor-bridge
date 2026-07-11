@@ -1,0 +1,7 @@
+# Real config holds the HMAC secret + Home Assistant token — never commit it.
+config.json
+config.*.json
+!config.example.json
+
+__pycache__/
+*.pyc

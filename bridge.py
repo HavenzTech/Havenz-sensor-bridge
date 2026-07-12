@@ -45,7 +45,7 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.1.1"
 
 
 def load_config(path):
@@ -70,12 +70,32 @@ def save_config(path, cfg):
 
 def fetch_states(ha, timeout=10):
     """GET every entity's current state from Home Assistant; return {entity_id: state_obj}."""
+    url = f"{ha['url'].rstrip('/')}/api/states"
+    if not ha.get("token"):
+        raise RuntimeError(
+            f"no Home Assistant token — every call to {url} will be rejected. In the add-on, set a "
+            "long-lived access token in the 'ha_token' option."
+        )
     req = urllib.request.Request(
-        f"{ha['url'].rstrip('/')}/api/states",
+        url,
         headers={"Authorization": f"Bearer {ha['token']}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        states = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            states = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # A bare "HTTP Error 401: Unauthorized" says nothing about which of the two auth paths
+        # failed, so surface the server's own reason and the URL we actually called.
+        body = e.read().decode("utf-8", "replace").strip()[:200]
+        hint = ""
+        if e.code in (401, 403):
+            hint = (
+                " — the token was rejected. If this is the Home Assistant add-on, the Supervisor "
+                "proxy refused SUPERVISOR_TOKEN; work around it by creating a long-lived access "
+                "token in Home Assistant (profile -> Security) and pasting it into the add-on's "
+                "'ha_token' option."
+            )
+        raise RuntimeError(f"GET {url} -> HTTP {e.code}{hint} {body}".rstrip()) from None
     return {s.get("entity_id"): s for s in states if s.get("entity_id")}
 
 

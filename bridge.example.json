@@ -1,0 +1,16 @@
+{
+  "_comment": "Standalone (non-add-on) gateway. Copy to config.json and set the two required keys below. You do NOT put a key or a property id here: start the bridge, open its setup page (http://<this-host>:8099), and enter the pairing code from the Havenz app (Property -> Control Room -> Gateways -> Add gateway). The bridge registers itself and writes hub_key/hub_id into config.json. Sensors are then connected in the app (Sensors -> Available to connect) -- nothing is mapped by hand.",
+
+  "api_url": "https://havenz-backend-599129251048.us-central1.run.app",
+
+  "home_assistant": {
+    "url": "http://localhost:8123",
+    "token": "PUT-A-HOME-ASSISTANT-LONG-LIVED-ACCESS-TOKEN-HERE"
+  },
+
+  "poll_interval_seconds": 30,
+  "setup_port": 8099,
+
+  "_zigbee": "Which Home Assistant service opens the Zigbee join window for 'Pair new device' in the app. The default suits ZHA. Zigbee2MQTT needs a different payload and is not supported by this setting today -- pair those sensors in Home Assistant directly and they still show up under 'Available to connect'.",
+  "permit_join_service": "zha/permit"
+}

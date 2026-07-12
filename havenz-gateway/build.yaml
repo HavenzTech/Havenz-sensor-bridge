@@ -1,0 +1,8 @@
+# Base image per architecture. Without this file the Supervisor never passes BUILD_FROM, so the
+# Dockerfile's `FROM ${BUILD_FROM}` resolves to empty and the build dies with
+# "base name (${BUILD_FROM}) should not be blank" on the user's device.
+#
+# Alpine base — the Dockerfile installs python3 with apk.
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base:3.21
+  amd64: ghcr.io/home-assistant/amd64-base:3.21

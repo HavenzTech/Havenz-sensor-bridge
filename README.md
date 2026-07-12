@@ -23,7 +23,7 @@ See [`havenz-gateway/DOCS.md`](havenz-gateway/DOCS.md). This is the packaging fo
 Pure Python 3 standard library — **no pip installs**.
 
 ```bash
-cp config.example.json config.json      # set api_url + home_assistant.url/token
+cp bridge.example.json config.json      # set api_url + home_assistant.url/token
 python3 bridge.py config.json           # unpaired → hosts a setup page on :8099
 ```
 Then either:

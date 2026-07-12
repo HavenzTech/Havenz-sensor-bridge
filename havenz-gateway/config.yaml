@@ -3,12 +3,10 @@ version: "1.1.0"
 slug: havenz_gateway
 description: Connects this site's Home Assistant sensors to Havenz.
 url: https://github.com/HavenzTech/Havenz-sensor-bridge
+# armv7/armhf/i386 are deprecated by the Supervisor and we ship no base image for them.
 arch:
   - aarch64
   - amd64
-  - armv7
-  - armhf
-  - i386
 init: false
 boot: auto
 # Talk to Home Assistant's API through the Supervisor (no user token needed).

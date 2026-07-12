@@ -1,5 +1,5 @@
 name: Havenz Gateway
-version: "1.1.0"
+version: "1.1.1"
 slug: havenz_gateway
 description: Connects this site's Home Assistant sensors to Havenz.
 url: https://github.com/HavenzTech/Havenz-sensor-bridge
@@ -19,6 +19,11 @@ panel_title: Havenz
 options:
   api_url: "https://havenz-backend-599129251048.us-central1.run.app"
   poll_interval_seconds: 30
+  ha_token: ""
 schema:
   api_url: url
   poll_interval_seconds: int(5,3600)
+  # Normally blank: the gateway reaches Home Assistant through the Supervisor. Fill this in only if
+  # the log shows Home Assistant returning 401 — the Supervisor proxy refusing SUPERVISOR_TOKEN is a
+  # known failure, and a long-lived token bypasses it entirely.
+  ha_token: password?

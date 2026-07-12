@@ -38,6 +38,26 @@ in the Havenz app, which opens the pairing window for you). Then in the Havenz a
 |--------|---------|
 | `api_url` | Your Havenz backend URL. Leave the default unless self-hosting. |
 | `poll_interval_seconds` | How often readings are sent (5–3600s). Default 30. |
+| `ha_token` | Normally blank. Only needed if the log shows Home Assistant returning **401** — see below. |
+
+## If the log says "401 Unauthorized" from Home Assistant
+
+The gateway normally reaches Home Assistant through the Supervisor, with no token to create. On some
+systems the Supervisor rejects that — the log then repeats:
+
+```
+could not read Home Assistant states: GET http://supervisor/core/api/states -> HTTP 401
+```
+
+The gateway pairs fine but never reports, so it shows **Offline** in the Havenz app and no sensors
+appear. To work around it:
+
+1. In Home Assistant, click your **user name** (bottom-left) → **Security** tab → scroll to
+   **Long-lived access tokens** → **Create token**. Copy it.
+2. This add-on → **Configuration** → paste it into **`ha_token`** → **Save**.
+3. **Restart** the add-on.
+
+The log should then read `discovery: reported N entities` and the gateway goes Online.
 
 ## Notes
 

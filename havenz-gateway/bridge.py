@@ -23,6 +23,10 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import socket
+import ssl
+import struct
 import sys
 import threading
 import time
@@ -30,6 +34,7 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("havenz-bridge")
@@ -184,8 +189,128 @@ def backend_post(cfg, path, payload, timeout=15):
         return json.loads(raw) if raw else {}
 
 
+# ---------------------------------------------------------------------------
+# Minimal WebSocket client (pure stdlib) for Home Assistant's websocket API.
+#
+# Why this exists: ZHA's REST service `zha.permit` returns 200 but — observed on a real
+# HAOS Pi — the join window it opens does not accept the device, while the Add-device
+# flow in HA's own UI (which uses the websocket command `zha/devices/permit`) pairs the
+# same sensor instantly. So we speak the exact same websocket command the UI does.
+# ---------------------------------------------------------------------------
+
+class _WS:
+    """Just enough RFC6455 to auth and exchange small JSON messages with HA."""
+
+    def __init__(self, url, timeout=10):
+        u = urlparse(url)
+        port = u.port or (443 if u.scheme == "wss" else 80)
+        self.sock = socket.create_connection((u.hostname, port), timeout=timeout)
+        if u.scheme == "wss":
+            self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=u.hostname)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            (f"GET {u.path or '/'} HTTP/1.1\r\nHost: {u.hostname}:{port}\r\n"
+             f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket handshake: connection closed")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode()
+        if " 101 " not in f" {status} ":
+            raise RuntimeError(f"websocket handshake rejected: {status}")
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket: connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send_json(self, obj):
+        data = json.dumps(obj).encode()
+        n = len(data)
+        if n < 126:
+            header = b"\x81" + bytes([0x80 | n])
+        elif n < 65536:
+            header = b"\x81" + bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            header = b"\x81" + bytes([0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv_json(self):
+        while True:
+            b1, b2 = self._read(2)
+            opcode, ln = b1 & 0x0F, b2 & 0x7F
+            if ln == 126:
+                ln = struct.unpack(">H", self._read(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if b2 & 0x80 else None
+            payload = self._read(ln)
+            if mask:
+                payload = bytes(x ^ mask[i % 4] for i, x in enumerate(payload))
+            if opcode == 1:
+                return json.loads(payload.decode())
+            if opcode == 8:
+                raise RuntimeError("websocket closed by server")
+            # ignore ping/pong/binary; HA's messages to us are small text frames
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def ha_ws_command(ha, command, timeout=10):
+    """Run one authenticated command against HA's websocket API; raise if it fails."""
+    base = ha["url"].rstrip("/")
+    scheme = "wss" if base.startswith("https://") else "ws"
+    hostpart = base.split("://", 1)[1]
+    # Supervisor proxy exposes the Core socket at /core/websocket; direct Core at /api/websocket.
+    path = "/websocket" if hostpart.endswith("/core") else "/api/websocket"
+    ws = _WS(f"{scheme}://{hostpart}{path}", timeout=timeout)
+    try:
+        first = ws.recv_json()
+        if first.get("type") == "auth_required":
+            ws.send_json({"type": "auth", "access_token": ha["token"]})
+            reply = ws.recv_json()
+            if reply.get("type") != "auth_ok":
+                raise RuntimeError(f"websocket auth failed: {reply.get('message', reply.get('type'))}")
+        ws.send_json({"id": 1, **command})
+        while True:
+            msg = ws.recv_json()
+            if msg.get("id") == 1 and msg.get("type") == "result":
+                if not msg.get("success"):
+                    raise RuntimeError(f"{command['type']} failed: {msg.get('error')}")
+                return msg.get("result")
+    finally:
+        ws.close()
+
+
 def open_permit_join(cfg, duration):
-    """Ask Home Assistant to open its Zigbee join window (so a new sensor can pair)."""
+    """Open the Zigbee join window, exactly the way Home Assistant's own UI does."""
+    ha = cfg["home_assistant"]
+    service = cfg.get("permit_join_service", "zha/permit")
+    if service == "zha/permit":
+        try:
+            ha_ws_command(ha, {"type": "zha/devices/permit", "duration": int(duration)})
+            log.info("opened the Zigbee join window for %ss (websocket) — press the sensor's button now", duration)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("websocket permit failed (%s) — falling back to the zha.permit service", e)
+    return _open_permit_join_service(cfg, duration)
+
+
+def _open_permit_join_service(cfg, duration):
+    """REST service-call fallback (also the Zigbee2MQTT path via permit_join_service)."""
     ha = cfg["home_assistant"]
     # HA services API path, e.g. /api/services/zha/permit. Override for Zigbee2MQTT setups.
     service = cfg.get("permit_join_service", "zha/permit")

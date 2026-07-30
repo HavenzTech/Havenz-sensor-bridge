@@ -23,6 +23,10 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import socket
+import ssl
+import struct
 import sys
 import threading
 import time
@@ -30,6 +34,7 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("havenz-bridge")
@@ -45,7 +50,22 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.1.1"
+AGENT_VERSION = "1.3.0"
+
+# While a pairing window is open, poll this fast so a joining sensor appears within seconds.
+# The grace period covers the ZHA interview + first attribute report after the window closes.
+FAST_POLL_SECONDS = 3
+PAIR_FAST_GRACE_SECONDS = 45
+
+# HA binary_sensor states are words, not numbers. Map them onto 1/0 so contact, leak, motion
+# and occupancy sensors produce metrics; 1 always means "the thing the sensor exists to detect".
+BINARY_STATES = {
+    "on": 1.0, "off": 0.0,
+    "open": 1.0, "closed": 0.0,
+    "wet": 1.0, "dry": 0.0,
+    "detected": 1.0, "clear": 0.0,
+    "true": 1.0, "false": 0.0,
+}
 
 
 def load_config(path):
@@ -57,7 +77,7 @@ def load_config(path):
     cfg.setdefault("ingest_path", "/api/iot/ingest")
     cfg.setdefault("discovery_path", "/api/iot/discovery")
     cfg.setdefault("register_path", "/api/bridge/register")
-    cfg.setdefault("poll_interval_seconds", 30)
+    cfg.setdefault("poll_interval_seconds", 15)
     cfg.setdefault("mappings", [])
     return cfg
 
@@ -116,14 +136,17 @@ def discovery_entities(states):
         if any(h in eid for h in INFRA_ENTITY_HINTS):
             continue  # the hub/host's own diagnostics, not a user sensor
         raw = st.get("state")
-        if raw in (None, "unknown", "unavailable", ""):
-            continue
+        if raw in (None, "unavailable", ""):
+            continue  # dead/removed device — don't offer ghosts as connectable
+        # "unknown" is a live entity that simply hasn't reported yet — which is exactly what a
+        # freshly paired sensor looks like. Report it (stateless) so it shows up immediately
+        # instead of only after its first reading, minutes later.
         out.append({
             "entityId": eid,
             "friendlyName": attrs.get("friendly_name"),
             "deviceClass": device_class,
             "unit": unit,
-            "state": str(raw),
+            "state": None if raw == "unknown" else str(raw),
         })
     return out
 
@@ -166,8 +189,128 @@ def backend_post(cfg, path, payload, timeout=15):
         return json.loads(raw) if raw else {}
 
 
+# ---------------------------------------------------------------------------
+# Minimal WebSocket client (pure stdlib) for Home Assistant's websocket API.
+#
+# Why this exists: ZHA's REST service `zha.permit` returns 200 but — observed on a real
+# HAOS Pi — the join window it opens does not accept the device, while the Add-device
+# flow in HA's own UI (which uses the websocket command `zha/devices/permit`) pairs the
+# same sensor instantly. So we speak the exact same websocket command the UI does.
+# ---------------------------------------------------------------------------
+
+class _WS:
+    """Just enough RFC6455 to auth and exchange small JSON messages with HA."""
+
+    def __init__(self, url, timeout=10):
+        u = urlparse(url)
+        port = u.port or (443 if u.scheme == "wss" else 80)
+        self.sock = socket.create_connection((u.hostname, port), timeout=timeout)
+        if u.scheme == "wss":
+            self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=u.hostname)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            (f"GET {u.path or '/'} HTTP/1.1\r\nHost: {u.hostname}:{port}\r\n"
+             f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket handshake: connection closed")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode()
+        if " 101 " not in f" {status} ":
+            raise RuntimeError(f"websocket handshake rejected: {status}")
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket: connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send_json(self, obj):
+        data = json.dumps(obj).encode()
+        n = len(data)
+        if n < 126:
+            header = b"\x81" + bytes([0x80 | n])
+        elif n < 65536:
+            header = b"\x81" + bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            header = b"\x81" + bytes([0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv_json(self):
+        while True:
+            b1, b2 = self._read(2)
+            opcode, ln = b1 & 0x0F, b2 & 0x7F
+            if ln == 126:
+                ln = struct.unpack(">H", self._read(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if b2 & 0x80 else None
+            payload = self._read(ln)
+            if mask:
+                payload = bytes(x ^ mask[i % 4] for i, x in enumerate(payload))
+            if opcode == 1:
+                return json.loads(payload.decode())
+            if opcode == 8:
+                raise RuntimeError("websocket closed by server")
+            # ignore ping/pong/binary; HA's messages to us are small text frames
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def ha_ws_command(ha, command, timeout=10):
+    """Run one authenticated command against HA's websocket API; raise if it fails."""
+    base = ha["url"].rstrip("/")
+    scheme = "wss" if base.startswith("https://") else "ws"
+    hostpart = base.split("://", 1)[1]
+    # Supervisor proxy exposes the Core socket at /core/websocket; direct Core at /api/websocket.
+    path = "/websocket" if hostpart.endswith("/core") else "/api/websocket"
+    ws = _WS(f"{scheme}://{hostpart}{path}", timeout=timeout)
+    try:
+        first = ws.recv_json()
+        if first.get("type") == "auth_required":
+            ws.send_json({"type": "auth", "access_token": ha["token"]})
+            reply = ws.recv_json()
+            if reply.get("type") != "auth_ok":
+                raise RuntimeError(f"websocket auth failed: {reply.get('message', reply.get('type'))}")
+        ws.send_json({"id": 1, **command})
+        while True:
+            msg = ws.recv_json()
+            if msg.get("id") == 1 and msg.get("type") == "result":
+                if not msg.get("success"):
+                    raise RuntimeError(f"{command['type']} failed: {msg.get('error')}")
+                return msg.get("result")
+    finally:
+        ws.close()
+
+
 def open_permit_join(cfg, duration):
-    """Ask Home Assistant to open its Zigbee join window (so a new sensor can pair)."""
+    """Open the Zigbee join window, exactly the way Home Assistant's own UI does."""
+    ha = cfg["home_assistant"]
+    service = cfg.get("permit_join_service", "zha/permit")
+    if service == "zha/permit":
+        try:
+            ha_ws_command(ha, {"type": "zha/devices/permit", "duration": int(duration)})
+            log.info("opened the Zigbee join window for %ss (websocket) — press the sensor's button now", duration)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("websocket permit failed (%s) — falling back to the zha.permit service", e)
+    return _open_permit_join_service(cfg, duration)
+
+
+def _open_permit_join_service(cfg, duration):
+    """REST service-call fallback (also the Zigbee2MQTT path via permit_join_service)."""
     ha = cfg["home_assistant"]
     # HA services API path, e.g. /api/services/zha/permit. Override for Zigbee2MQTT setups.
     service = cfg.get("permit_join_service", "zha/permit")
@@ -180,12 +323,14 @@ def open_permit_join(cfg, duration):
     try:
         with urllib.request.urlopen(req, timeout=10):
             log.info("opened Home Assistant pairing window for %ss — press the sensor's button now", duration)
+            return True
     except Exception as e:  # noqa: BLE001
         log.error("failed to open pairing window (%s): %s", service, e)
+        return False
 
 
 def run_discovery(cfg, states):
-    """Report the entity catalog; return the active mappings the backend hands back."""
+    """Report the entity catalog. Returns (active mappings, pairing-window-open-until epoch or None)."""
     entities = discovery_entities(states)
     if cfg.get("hub_key"):
         # A registered hub: identity + property come from the key, not the body.
@@ -193,20 +338,25 @@ def run_discovery(cfg, states):
     elif cfg.get("property_id"):
         payload = {"propertyId": cfg["property_id"], "source": "home-assistant", "entities": entities}
     else:
-        return []  # not registered and no property configured — nothing to report to
+        return [], None  # not registered and no property configured — nothing to report to
     try:
         resp = backend_post(cfg, cfg["discovery_path"], payload)
         mappings = resp.get("mappings", []) or []
         log.info("discovery: reported %d entities, %d active mapping(s)", len(entities), len(mappings))
         permit = resp.get("permitJoin")
+        window_until = None
         if permit:
-            open_permit_join(cfg, permit.get("duration", 60))
-        return mappings
+            duration = int(permit.get("duration", 60))
+            if open_permit_join(cfg, duration):
+                # Poll fast while the window is open (plus grace for the ZHA interview to finish),
+                # so a joining sensor appears in the UI within seconds, not next cycle.
+                window_until = time.time() + duration + PAIR_FAST_GRACE_SECONDS
+        return mappings, window_until
     except urllib.error.HTTPError as e:
         log.error("discovery rejected: HTTP %s — %s", e.code, e.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         log.warning("discovery failed (will still forward known mappings): %s", e)
-    return []
+    return [], None
 
 
 def combined_mappings(cfg, dynamic):
@@ -245,7 +395,9 @@ def build_readings(mappings, states):
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            continue  # non-numeric (e.g. a binary_sensor word) — skip for metrics
+            value = BINARY_STATES.get(str(raw).strip().lower())
+            if value is None:
+                continue  # not a number and not a known binary word — nothing to report
         reading = {"deviceKey": m["deviceKey"], "metricType": m["metricType"], "value": value}
         unit = m.get("unit") or st.get("attributes", {}).get("unit_of_measurement")
         if unit:
@@ -259,19 +411,20 @@ def build_readings(mappings, states):
 
 
 def run_once(cfg):
+    """One poll cycle. Returns the pairing-window fast-poll deadline if one was just opened."""
     try:
         states = fetch_states(cfg["home_assistant"])
     except Exception as e:  # noqa: BLE001
         log.error("could not read Home Assistant states: %s", e)
-        return
+        return None
 
-    dynamic = run_discovery(cfg, states)
+    dynamic, window_until = run_discovery(cfg, states)
     mappings = combined_mappings(cfg, dynamic)
     readings = build_readings(mappings, states)
 
     if not readings:
         log.info("no readings this cycle (%d mappings)", len(mappings))
-        return
+        return window_until
     try:
         result = backend_post(cfg, cfg["ingest_path"], readings)
         log.info("posted %d readings — accepted=%s rejected=%s unknown=%s",
@@ -281,6 +434,7 @@ def run_once(cfg):
         log.error("ingest rejected: HTTP %s — %s", e.code, e.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         log.error("ingest failed: %s", e)
+    return window_until
 
 
 def register(cfg_path, cfg, code):
@@ -433,9 +587,15 @@ def main():
     if "--once" in args:
         run_once(cfg)
         return
+    fast_until = 0.0
     while True:
-        run_once(cfg)
-        time.sleep(cfg["poll_interval_seconds"])
+        window = run_once(cfg)
+        if window:
+            fast_until = max(fast_until, window)
+        if time.time() < fast_until:
+            time.sleep(FAST_POLL_SECONDS)  # pairing in progress — stay responsive
+        else:
+            time.sleep(cfg["poll_interval_seconds"])
 
 
 if __name__ == "__main__":

@@ -36,10 +36,26 @@ opts = read_json("/data/options.json", {})     # user's add-on options
 cfg = read_json(CONFIG, {})                     # keep hub_key etc. across restarts
 
 cfg["api_url"] = opts.get("api_url", cfg.get("api_url"))
-cfg["poll_interval_seconds"] = int(opts.get("poll_interval_seconds", cfg.get("poll_interval_seconds", 30)))
+cfg["poll_interval_seconds"] = int(opts.get("poll_interval_seconds", cfg.get("poll_interval_seconds", 15)))
+
+def s6_env(name):
+    # s6-overlay does not pass the container's environment to services: the Supervisor sets
+    # SUPERVISOR_TOKEN on the container, but s6 strips it and writes each variable to a file
+    # under /run/s6/container_environment instead (opt-in via with-contenv, which we don't get
+    # to control from a plain CMD). Read the file back so the token flows as designed.
+    try:
+        with open(f"/run/s6/container_environment/{name}", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
 
 ha_token = str(opts.get("ha_token") or "").strip()
 sup_token = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or ""
+token_source = "environment"
+if not sup_token:
+    sup_token = s6_env("SUPERVISOR_TOKEN") or s6_env("HASSIO_TOKEN")
+    token_source = "/run/s6/container_environment"
 
 if ha_token:
     # Straight to Core, bypassing the Supervisor entirely.
@@ -48,7 +64,7 @@ if ha_token:
 else:
     cfg["home_assistant"] = {"url": "http://supervisor/core", "token": sup_token}
     if sup_token:
-        log(f"Home Assistant: using the Supervisor proxy (token present, {len(sup_token)} chars).")
+        log(f"Home Assistant: using the Supervisor proxy (token from {token_source}, {len(sup_token)} chars).")
     else:
         # This is the failure that produces "401 Unauthorized" on every poll. Name it loudly, and
         # print which token-ish variables DO exist so the cause is visible in one glance.

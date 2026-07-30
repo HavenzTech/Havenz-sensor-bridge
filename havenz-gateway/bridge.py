@@ -45,7 +45,17 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.1.1"
+AGENT_VERSION = "1.2.0"
+
+# HA binary_sensor states are words, not numbers. Map them onto 1/0 so contact, leak, motion
+# and occupancy sensors produce metrics; 1 always means "the thing the sensor exists to detect".
+BINARY_STATES = {
+    "on": 1.0, "off": 0.0,
+    "open": 1.0, "closed": 0.0,
+    "wet": 1.0, "dry": 0.0,
+    "detected": 1.0, "clear": 0.0,
+    "true": 1.0, "false": 0.0,
+}
 
 
 def load_config(path):
@@ -245,7 +255,9 @@ def build_readings(mappings, states):
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            continue  # non-numeric (e.g. a binary_sensor word) — skip for metrics
+            value = BINARY_STATES.get(str(raw).strip().lower())
+            if value is None:
+                continue  # not a number and not a known binary word — nothing to report
         reading = {"deviceKey": m["deviceKey"], "metricType": m["metricType"], "value": value}
         unit = m.get("unit") or st.get("attributes", {}).get("unit_of_measurement")
         if unit:

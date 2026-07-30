@@ -42,8 +42,10 @@ in the Havenz app, which opens the pairing window for you). Then in the Havenz a
 
 ## If the log says "401 Unauthorized" from Home Assistant
 
-The gateway normally reaches Home Assistant through the Supervisor, with no token to create. On some
-systems the Supervisor rejects that — the log then repeats:
+The gateway normally reaches Home Assistant through the Supervisor, with no token to create.
+(Since 1.2.0 the gateway also reads the Supervisor's token from s6's `container_environment`,
+which fixes the known case where the startup log said `no SUPERVISOR_TOKEN in the environment` —
+so a 401 should now be rare.) If the log still repeats:
 
 ```
 could not read Home Assistant states: GET http://supervisor/core/api/states -> HTTP 401

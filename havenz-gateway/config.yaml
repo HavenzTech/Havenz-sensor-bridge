@@ -1,5 +1,5 @@
 name: Havenz Gateway
-version: "1.1.1"
+version: "1.2.0"
 slug: havenz_gateway
 description: Connects this site's Home Assistant sensors to Havenz.
 url: https://github.com/HavenzTech/Havenz-sensor-bridge

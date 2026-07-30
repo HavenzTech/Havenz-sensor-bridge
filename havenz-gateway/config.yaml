@@ -1,5 +1,5 @@
 name: Havenz Gateway
-version: "1.2.0"
+version: "1.3.0"
 slug: havenz_gateway
 description: Connects this site's Home Assistant sensors to Havenz.
 url: https://github.com/HavenzTech/Havenz-sensor-bridge
@@ -18,7 +18,7 @@ panel_icon: mdi:lan-connect
 panel_title: Havenz
 options:
   api_url: "https://havenz-backend-599129251048.us-central1.run.app"
-  poll_interval_seconds: 30
+  poll_interval_seconds: 15
   ha_token: ""
 schema:
   api_url: url

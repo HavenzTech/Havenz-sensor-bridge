@@ -45,7 +45,12 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
+
+# While a pairing window is open, poll this fast so a joining sensor appears within seconds.
+# The grace period covers the ZHA interview + first attribute report after the window closes.
+FAST_POLL_SECONDS = 3
+PAIR_FAST_GRACE_SECONDS = 45
 
 # HA binary_sensor states are words, not numbers. Map them onto 1/0 so contact, leak, motion
 # and occupancy sensors produce metrics; 1 always means "the thing the sensor exists to detect".
@@ -67,7 +72,7 @@ def load_config(path):
     cfg.setdefault("ingest_path", "/api/iot/ingest")
     cfg.setdefault("discovery_path", "/api/iot/discovery")
     cfg.setdefault("register_path", "/api/bridge/register")
-    cfg.setdefault("poll_interval_seconds", 30)
+    cfg.setdefault("poll_interval_seconds", 15)
     cfg.setdefault("mappings", [])
     return cfg
 
@@ -126,14 +131,17 @@ def discovery_entities(states):
         if any(h in eid for h in INFRA_ENTITY_HINTS):
             continue  # the hub/host's own diagnostics, not a user sensor
         raw = st.get("state")
-        if raw in (None, "unknown", "unavailable", ""):
-            continue
+        if raw in (None, "unavailable", ""):
+            continue  # dead/removed device — don't offer ghosts as connectable
+        # "unknown" is a live entity that simply hasn't reported yet — which is exactly what a
+        # freshly paired sensor looks like. Report it (stateless) so it shows up immediately
+        # instead of only after its first reading, minutes later.
         out.append({
             "entityId": eid,
             "friendlyName": attrs.get("friendly_name"),
             "deviceClass": device_class,
             "unit": unit,
-            "state": str(raw),
+            "state": None if raw == "unknown" else str(raw),
         })
     return out
 
@@ -190,12 +198,14 @@ def open_permit_join(cfg, duration):
     try:
         with urllib.request.urlopen(req, timeout=10):
             log.info("opened Home Assistant pairing window for %ss — press the sensor's button now", duration)
+            return True
     except Exception as e:  # noqa: BLE001
         log.error("failed to open pairing window (%s): %s", service, e)
+        return False
 
 
 def run_discovery(cfg, states):
-    """Report the entity catalog; return the active mappings the backend hands back."""
+    """Report the entity catalog. Returns (active mappings, pairing-window-open-until epoch or None)."""
     entities = discovery_entities(states)
     if cfg.get("hub_key"):
         # A registered hub: identity + property come from the key, not the body.
@@ -203,20 +213,25 @@ def run_discovery(cfg, states):
     elif cfg.get("property_id"):
         payload = {"propertyId": cfg["property_id"], "source": "home-assistant", "entities": entities}
     else:
-        return []  # not registered and no property configured — nothing to report to
+        return [], None  # not registered and no property configured — nothing to report to
     try:
         resp = backend_post(cfg, cfg["discovery_path"], payload)
         mappings = resp.get("mappings", []) or []
         log.info("discovery: reported %d entities, %d active mapping(s)", len(entities), len(mappings))
         permit = resp.get("permitJoin")
+        window_until = None
         if permit:
-            open_permit_join(cfg, permit.get("duration", 60))
-        return mappings
+            duration = int(permit.get("duration", 60))
+            if open_permit_join(cfg, duration):
+                # Poll fast while the window is open (plus grace for the ZHA interview to finish),
+                # so a joining sensor appears in the UI within seconds, not next cycle.
+                window_until = time.time() + duration + PAIR_FAST_GRACE_SECONDS
+        return mappings, window_until
     except urllib.error.HTTPError as e:
         log.error("discovery rejected: HTTP %s — %s", e.code, e.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         log.warning("discovery failed (will still forward known mappings): %s", e)
-    return []
+    return [], None
 
 
 def combined_mappings(cfg, dynamic):
@@ -271,19 +286,20 @@ def build_readings(mappings, states):
 
 
 def run_once(cfg):
+    """One poll cycle. Returns the pairing-window fast-poll deadline if one was just opened."""
     try:
         states = fetch_states(cfg["home_assistant"])
     except Exception as e:  # noqa: BLE001
         log.error("could not read Home Assistant states: %s", e)
-        return
+        return None
 
-    dynamic = run_discovery(cfg, states)
+    dynamic, window_until = run_discovery(cfg, states)
     mappings = combined_mappings(cfg, dynamic)
     readings = build_readings(mappings, states)
 
     if not readings:
         log.info("no readings this cycle (%d mappings)", len(mappings))
-        return
+        return window_until
     try:
         result = backend_post(cfg, cfg["ingest_path"], readings)
         log.info("posted %d readings — accepted=%s rejected=%s unknown=%s",
@@ -293,6 +309,7 @@ def run_once(cfg):
         log.error("ingest rejected: HTTP %s — %s", e.code, e.read().decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         log.error("ingest failed: %s", e)
+    return window_until
 
 
 def register(cfg_path, cfg, code):
@@ -445,9 +462,15 @@ def main():
     if "--once" in args:
         run_once(cfg)
         return
+    fast_until = 0.0
     while True:
-        run_once(cfg)
-        time.sleep(cfg["poll_interval_seconds"])
+        window = run_once(cfg)
+        if window:
+            fast_until = max(fast_until, window)
+        if time.time() < fast_until:
+            time.sleep(FAST_POLL_SECONDS)  # pairing in progress — stay responsive
+        else:
+            time.sleep(cfg["poll_interval_seconds"])
 
 
 if __name__ == "__main__":

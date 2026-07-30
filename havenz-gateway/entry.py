@@ -36,7 +36,7 @@ opts = read_json("/data/options.json", {})     # user's add-on options
 cfg = read_json(CONFIG, {})                     # keep hub_key etc. across restarts
 
 cfg["api_url"] = opts.get("api_url", cfg.get("api_url"))
-cfg["poll_interval_seconds"] = int(opts.get("poll_interval_seconds", cfg.get("poll_interval_seconds", 30)))
+cfg["poll_interval_seconds"] = int(opts.get("poll_interval_seconds", cfg.get("poll_interval_seconds", 15)))
 
 def s6_env(name):
     # s6-overlay does not pass the container's environment to services: the Supervisor sets

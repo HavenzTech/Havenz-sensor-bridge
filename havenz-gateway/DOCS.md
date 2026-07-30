@@ -37,7 +37,7 @@ in the Havenz app, which opens the pairing window for you). Then in the Havenz a
 | Option | Meaning |
 |--------|---------|
 | `api_url` | Your Havenz backend URL. Leave the default unless self-hosting. |
-| `poll_interval_seconds` | How often readings are sent (5–3600s). Default 30. |
+| `poll_interval_seconds` | How often readings are sent (5–3600s). Default 15. |
 | `ha_token` | Normally blank. Only needed if the log shows Home Assistant returning **401** — see below. |
 
 ## If the log says "401 Unauthorized" from Home Assistant

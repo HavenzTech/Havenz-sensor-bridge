@@ -50,7 +50,7 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.3.1"
 
 # While a pairing window is open, poll this fast so a joining sensor appears within seconds.
 # The grace period covers the ZHA interview + first attribute report after the window closes.
@@ -454,6 +454,7 @@ def register(cfg_path, cfg, code):
     cfg["hub_id"] = data.get("hubId")
     cfg["property_id"] = data.get("propertyId")
     cfg.pop("secret", None)  # no longer needed once we have a hub key
+    cfg["mappings"] = []  # adopted-sensor mappings belong to the previous property
     save_config(cfg_path, cfg)
     log.info("registered hub '%s' to property %s — key saved to %s",
              data.get("name"), data.get("propertyId"), cfg_path)
@@ -510,9 +511,38 @@ STATUS_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>:root{color-scheme:light dark}body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;
 min-height:100vh;display:grid;place-items:center;background:#0b0f14;color:#e7edf3}
 .card{width:min(92vw,420px);background:#121821;border:1px solid #223;border-radius:16px;padding:28px;text-align:center}
-h1{font-size:20px;margin:0 0 6px}.ok{color:#34d399;font-size:15px}p{color:#93a1b0;font-size:14px}</style></head>
+h1{font-size:20px;margin:0 0 6px}.ok{color:#34d399;font-size:15px}p{color:#93a1b0;font-size:14px}
+details{margin-top:18px}summary{color:#93a1b0;font-size:13px;cursor:pointer}
+input{width:100%;box-sizing:border-box;font-size:18px;letter-spacing:.12em;text-align:center;margin-top:12px;
+padding:12px;border-radius:10px;border:1px solid #2a3a4a;background:#0d131a;color:#fff;text-transform:uppercase}
+button{width:100%;margin-top:12px;padding:12px;font-size:15px;font-weight:600;border:0;border-radius:10px;
+background:#06b6d4;color:#012;cursor:pointer}button:disabled{opacity:.6;cursor:default}
+.msg{margin-top:12px;font-size:14px;min-height:20px}.err{color:#f87171}</style></head>
 <body><div class="card"><h1>Havenz gateway</h1><div class="ok">&#10003; Connected</div>
-<p>This gateway is paired and reporting its sensors to Havenz. Manage them in the Havenz app.</p></div></body></html>"""
+<p>This gateway is paired and reporting its sensors to Havenz. Manage them in the Havenz app.</p>
+<details><summary>Move this gateway to a different property</summary>
+<p style="margin-top:10px">Enter a new pairing code (Property &rarr; Gateways &rarr; Add gateway
+in the Havenz app). The gateway switches to that property; its sensors then show up there under
+Available to connect.</p>
+<input id="code" placeholder="HVNZ-XXXX-XXXX" autocomplete="off">
+<button id="go">Move gateway</button>
+<div class="msg" id="msg"></div></details></div>
+<script>
+  const btn = document.getElementById('go'), inp = document.getElementById('code'), msg = document.getElementById('msg');
+  btn.onclick = async () => {
+    const code = inp.value.trim().toUpperCase();
+    if (!code) { msg.className='msg err'; msg.textContent='Enter your pairing code'; return; }
+    btn.disabled = true; msg.className='msg'; msg.textContent='Moving\\u2026';
+    try {
+      // relative URL so it works both standalone and behind Home Assistant ingress
+      const r = await fetch('register', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({pairingCode: code})});
+      const d = await r.json();
+      if (r.ok) { msg.className='msg ok'; msg.textContent='Moved! Open the new property in the Havenz app \\u2014 your sensors will appear under Available to connect.'; inp.disabled=true; }
+      else { msg.className='msg err'; msg.textContent = d.error || 'That code did not work.'; btn.disabled=false; }
+    } catch (e) { msg.className='msg err'; msg.textContent='Could not reach the gateway.'; btn.disabled=false; }
+  };
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') btn.click(); });
+</script></body></html>"""
 
 
 def start_web_server(cfg_path, cfg, port, paired_event):

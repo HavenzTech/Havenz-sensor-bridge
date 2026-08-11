@@ -50,7 +50,7 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.3.1"
+AGENT_VERSION = "1.3.2"
 
 # While a pairing window is open, poll this fast so a joining sensor appears within seconds.
 # The grace period covers the ZHA interview + first attribute report after the window closes.
@@ -440,7 +440,15 @@ def run_once(cfg):
 def register(cfg_path, cfg, code):
     """Exchange a pairing code for this hub's API key and store it in the config."""
     code = code.strip().upper()
-    body = json.dumps({"pairingCode": code, "agentVersion": AGENT_VERSION}).encode("utf-8")
+    # Say what we are. There are now two Havenz add-ons that pair through this endpoint, so an
+    # installer holding two codes will eventually type the agent's into this box. Declaring the
+    # kind lets the backend refuse it without consuming it, leaving the code usable on the add-on
+    # it was meant for.
+    body = json.dumps({
+        "pairingCode": code,
+        "agentVersion": AGENT_VERSION,
+        "expectedKind": "sensor",
+    }).encode("utf-8")
     url = f"{cfg['api_url'].rstrip('/')}{cfg['register_path']}"
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})

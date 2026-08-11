@@ -124,7 +124,14 @@ def register(cfg_path, cfg, code):
     pairing, revocation and liveness rather than having two implementations of each.
     """
     code = code.strip().upper()
-    body = json.dumps({"pairingCode": code, "agentVersion": AGENT_VERSION}).encode("utf-8")
+    # Declaring what we are lets the backend refuse a sensor-gateway code without consuming it, so
+    # the installer can retype the same code on the right add-on. Without this the code is spent on
+    # the mistake and they have to go back to the app for a new one.
+    body = json.dumps({
+        "pairingCode": code,
+        "agentVersion": AGENT_VERSION,
+        "expectedKind": "agent",
+    }).encode("utf-8")
     url = f"{cfg['api_url'].rstrip('/')}{cfg['register_path']}"
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
@@ -134,11 +141,9 @@ def register(cfg_path, cfg, code):
     except urllib.error.HTTPError as e:
         raise SystemExit(f"pairing failed: HTTP {e.code} — {e.read().decode('utf-8', 'replace')}")
 
-    # Refuse a code that was issued for a sensor gateway.
-    #
-    # Both add-ons pair identically, so without this check the wrong code pairs successfully and
-    # then every call afterwards fails for a reason nobody standing in a plant room can see. Fail
-    # here, where the message can say exactly what happened.
+    # Belt and braces. A backend that predates `expectedKind` will happily pair us to a sensor hub,
+    # and the failure that produces — every later call rejected, for a reason nobody standing in a
+    # plant room can see — is bad enough to be worth catching on both sides.
     kind = (data.get("kind") or "").lower()
     if kind and kind != "agent":
         raise SystemExit(
@@ -447,6 +452,11 @@ def main():
     paired = threading.Event()
     if cfg.get("hub_key"):
         paired.set()
+
+    # --once is a diagnostic: do one cycle and report. Waiting indefinitely for someone to pair
+    # would make it look like a hang, which is exactly what it did the first time it was used.
+    if "--once" in args and not cfg.get("hub_key"):
+        raise SystemExit("not paired — run with --register HVNZ-XXXX-XXXX first")
     if cfg.get("setup_server") or "--setup" in args or not cfg.get("hub_key"):
         start_web_server(cfg_path, cfg, int(cfg["setup_port"]), paired)
         if not paired.is_set():

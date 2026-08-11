@@ -35,8 +35,10 @@ cloud on every unlock and could never meet the latency budget a person standing 
 Pure standard library (no pip installs). Run:  python3 agent.py config.json [--register CODE]
 """
 
+import base64
 import json
 import logging
+import socket
 import sys
 import threading
 import time
@@ -61,6 +63,33 @@ CLOCK_SKEW_WARN_SECONDS = 30
 # within a minute of the link returning, rather than sleeping through the morning.
 BACKOFF_START_SECONDS = 5
 BACKOFF_MAX_SECONDS = 60
+
+# Where a reader posts its events, relative to the agent's address.
+#
+# A BASE, not a complete path: the reader builds hostname:port/{path}/{kind} and uses this one
+# value for /dao, /door, /operation_mode and /user_image alike. No leading slash, no kind suffix —
+# getting that wrong 404s every notification, which looks exactly like a reader that has gone
+# quiet. Kept in step with the backend's AmicoApiService.MonitorBasePath.
+MONITOR_BASE_PATH = "api/amico/notifications"
+
+
+def local_address_for(reader_ip):
+    """
+    Our own address as this reader would see it.
+
+    Asked of the routing table rather than assumed, because a Home Assistant box commonly has
+    several interfaces — Docker bridges, a VPN, wired and wireless — and the reader must be given
+    the one that actually reaches back here. No packet is sent; connect() on a UDP socket only
+    picks a route.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((reader_ip, 80))
+        return probe.getsockname()[0]
+    except Exception:  # noqa: BLE001
+        return socket.gethostbyname(socket.gethostname())
+    finally:
+        probe.close()
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +254,246 @@ class Reader:
             "actions": [{"action": "sec_box", "parameters": f"door={int(door)}"}]
         })
         return {}
+
+    def configure_monitor(self, host, port):
+        """
+        Point this reader at the agent, so its access events stay on the LAN.
+
+        `path` is a BASE, not a complete endpoint: the reader builds every URL as
+        hostname:port/{path}/{kind} and uses this one value for /dao, /door, /operation_mode and
+        /user_image alike. A leading slash or a kind suffix here produces 404s that look exactly
+        like a reader that has stopped reporting.
+
+        Everything is a string. set_configuration.fcgi answers non-strings with
+        {"error":"Invalid data (string expected)"} whatever the guide says a field's type is.
+        """
+        self.call("set_configuration.fcgi", {
+            "monitor": {
+                "request_timeout": "5000",
+                "hostname": str(host),
+                "port": str(port),
+                "path": MONITOR_BASE_PATH,
+            }
+        })
+        return {"hostname": str(host), "port": str(port), "path": MONITOR_BASE_PATH}
+
+    @staticmethod
+    def _require(payload, command, *fields):
+        """
+        Fail a malformed command with a message someone can act on.
+
+        Without this a missing field surfaces as `agent error: 'day'` — a bare KeyError, with no
+        indication of which command was malformed or what it wanted. That is the difference between
+        a five-second diagnosis and an afternoon of guessing, at a site nobody can walk into.
+        """
+        missing = [f for f in fields if payload.get(f) is None]
+        if missing:
+            raise ReaderError(
+                f"{command} was sent without {', '.join(missing)} — the agent cannot carry it out")
+
+    def sync_clock(self, payload):
+        self._require(payload, "SyncClock", "day", "month", "year", "hour", "minute", "second")
+        """
+        Set the clock from values the backend worked out.
+
+        The wall-clock components and the NTP offset arrive ready-made because the daylight-saving
+        reasoning behind them is subtle and already correct on the backend. Re-deriving it here
+        would give us two versions to keep in step and timestamps an hour apart twice a year.
+        """
+        self.call("set_system_time.fcgi", {
+            "day": int(payload["day"]), "month": int(payload["month"]), "year": int(payload["year"]),
+            "hour": int(payload["hour"]), "minute": int(payload["minute"]),
+            "second": int(payload["second"]),
+        })
+        self.call("set_configuration.fcgi", {
+            "ntp": {"enabled": "1", "timezone": str(payload.get("ntpTimezone", "UTC+0"))}
+        })
+        return {}
+
+    # -- users ------------------------------------------------------------
+
+    def find_user_id(self, registration):
+        """The reader's own numeric id for a Havenz user, or None."""
+        data = self.call("load_objects.fcgi", {
+            "object": "users",
+            "where": [{"field": "registration", "op": "=", "value": registration}],
+        })
+        # Firmware variation: results come back under "data" on some builds and "users" on others.
+        rows = data.get("data") or data.get("users") or []
+        return int(rows[0]["id"]) if rows else None
+
+    def _add_to_default_group(self, terminal_user_id):
+        """
+        Put the user in group 1, which is what actually authorises them at the door.
+
+        Creating the user is not enough on its own — without this they exist on the reader and are
+        refused entry. Failure is ignored because the usual cause is that they are already a
+        member, which the reader reports as an error rather than a no-op.
+        """
+        try:
+            self.call("create_objects.fcgi", {
+                "object": "user_groups",
+                "values": [{"user_id": terminal_user_id, "group_id": 1}],
+            })
+        except ReaderError:
+            pass
+
+    def create_user(self, payload):
+        self._require(payload, "CreateUser", "registration")
+        registration = payload["registration"]
+        existing = self.find_user_id(registration)
+
+        if existing is None:
+            self.call("create_objects.fcgi", {
+                "object": "users",
+                "values": [{
+                    "registration": registration,
+                    "name": payload.get("name"),
+                    "begin_time": payload.get("beginTime"),
+                    "end_time": payload.get("endTime"),
+                }],
+            })
+            existing = self.find_user_id(registration)
+
+        if existing is not None:
+            self._add_to_default_group(existing)
+        return {"terminalUserId": existing or 0}
+
+    def update_user(self, payload):
+        self._require(payload, "UpdateUser", "registration")
+        registration = payload["registration"]
+        terminal_user_id = self.find_user_id(registration)
+        if terminal_user_id is None:
+            return self.create_user(payload)   # not there yet; creating is the correct update
+
+        self.call("modify_objects.fcgi", {
+            "object": "users",
+            "where": {"users": {"id": terminal_user_id}},
+            "values": {
+                "registration": registration,
+                "name": payload.get("name"),
+                "begin_time": payload.get("beginTime"),
+                "end_time": payload.get("endTime"),
+            },
+        })
+        self._add_to_default_group(terminal_user_id)
+        return {"terminalUserId": terminal_user_id}
+
+    def delete_user(self, payload):
+        self._require(payload, "DeleteUser", "registration")
+        terminal_user_id = self.find_user_id(payload["registration"])
+        if terminal_user_id is None:
+            return {}      # already gone; deleting is idempotent by intent
+        self.call("destroy_objects.fcgi", {
+            "object": "users",
+            "where": {"users": {"id": terminal_user_id}},
+        })
+        return {}
+
+    def upload_face_photo(self, payload):
+        """
+        Push a face image for an existing user.
+
+        The only call that is not JSON: the image goes as a raw octet-stream body with everything
+        else in the query string.
+        """
+        self._require(payload, "UploadFacePhoto", "registration", "jpegBase64")
+        terminal_user_id = self.find_user_id(payload["registration"])
+        if terminal_user_id is None:
+            raise ReaderError(
+                f"user {payload['registration']} is not on {self.ip} yet, so there is nobody to "
+                "attach a face to")
+
+        jpeg = base64.b64decode(payload["jpegBase64"])
+        stamp = int(time.time())
+
+        for attempt in (1, 2):
+            session = self._session or self._login()
+            url = (f"http://{self.ip}/user_set_image.fcgi?session={session}"
+                   f"&user_id={terminal_user_id}&timestamp={stamp}&match=1")
+            req = urllib.request.Request(
+                url, data=jpeg, method="POST",
+                headers={"Content-Type": "application/octet-stream"})
+            try:
+                with urllib.request.urlopen(req, timeout=max(self._timeout, 30)) as resp:
+                    resp.read()
+                    return {"terminalUserId": terminal_user_id}
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 1:
+                    self._session = None
+                    continue
+                raise ReaderError(
+                    f"face upload to {self.ip}: HTTP {e.code} "
+                    f"{e.read().decode('utf-8','replace')[:160]}") from None
+            except Exception as e:  # noqa: BLE001
+                raise ReaderError(f"face upload to {self.ip}: {e}") from None
+
+    def remote_enroll(self, payload):
+        """
+        Capture a face at the reader, with someone standing in front of it.
+
+        Synchronous: the reader holds the request open until it has an image or gives up, so the
+        timeout here is a person's patience rather than the network's.
+        """
+        self._require(payload, "StartRemoteEnrollment", "registration")
+        terminal_user_id = self.find_user_id(payload["registration"])
+        if terminal_user_id is None:
+            raise ReaderError(
+                f"user {payload['registration']} must be synced to {self.ip} before enrolment")
+
+        previous, self._timeout = self._timeout, 100
+        try:
+            data = self.call("remote_enroll.fcgi", {
+                "type": "face", "user_id": terminal_user_id, "save": True, "sync": True,
+            })
+        finally:
+            self._timeout = previous
+
+        image = data.get("image")
+        if not image:
+            raise ReaderError("the reader finished enrolment but sent back no image")
+        return {"imageBase64": image}
+
+    # -- events -----------------------------------------------------------
+
+    def access_logs(self):
+        """
+        Every access-log row the reader is holding.
+
+        Timestamps are passed up untouched. The reader runs on local time and reports that wall
+        clock as if it were UTC; undoing that is the backend's job, in the one place that already
+        does it correctly.
+        """
+        data = self.call("load_objects.fcgi", {"object": "access_logs"})
+        entries = []
+        for row in data.get("access_logs") or []:
+            try:
+                entries.append({
+                    "id": int(row["id"]),
+                    # 0 means nobody was identified, which is a real and common outcome.
+                    "userId": int(row.get("user_id") or 0),
+                    "event": int(row.get("event") or 0),
+                    "time": int(row.get("time") or 0),
+                })
+            except (TypeError, ValueError):
+                continue   # one malformed row must not cost us the rest of the log
+        return {"entries": entries}
+
+    def registration_map(self):
+        """
+        The reader's numeric user ids mapped to Havenz user GUIDs.
+
+        Fetched whole rather than per event: a shift change is dozens of scans in a few minutes,
+        and a round trip each would not keep up.
+        """
+        data = self.call("load_objects.fcgi", {"object": "users"})
+        rows = data.get("data") or data.get("users") or []
+        mapping = {}
+        for row in rows:
+            registration = row.get("registration")
+            if row.get("id") is not None and registration:
+                mapping[str(row["id"])] = str(registration)
+        return {"map": mapping}
 
 
 def register(cfg_path, cfg, code):
@@ -445,7 +714,32 @@ def execute(cfg, command):
         return reader.system_info()
     if kind == "OpenDoor":
         return reader.open_door(payload.get("door", 1))
+    if kind == "ConfigureMonitor":
+        # The reader posts to us, not to the internet. Resolved fresh each time rather than cached,
+        # because a DHCP lease that moves the agent silently points all twenty readers at a dead
+        # address and every event quietly falls back to polling.
+        return reader.configure_monitor(local_address_for(reader.ip), cfg.get("webhook_port", 8100))
+    if kind == "SyncClock":
+        return reader.sync_clock(payload)
+    if kind == "CreateUser":
+        return reader.create_user(payload)
+    if kind == "UpdateUser":
+        return reader.update_user(payload)
+    if kind == "DeleteUser":
+        return reader.delete_user(payload)
+    if kind == "UploadFacePhoto":
+        return reader.upload_face_photo(payload)
+    if kind == "StartRemoteEnrollment":
+        return reader.remote_enroll(payload)
+    if kind == "GetAccessLogs":
+        return reader.access_logs()
+    if kind == "FindTerminalUserId":
+        Reader._require(payload, "FindTerminalUserId", "registration")
+        return {"terminalUserId": reader.find_user_id(payload["registration"]) or 0}
+    if kind == "GetUserRegistrationMap":
+        return reader.registration_map()
 
+    # An older agent meeting a newer backend. Say which version refused, so the fix is obvious.
     raise ReaderError(f"this agent does not know how to '{kind}' (agent v{AGENT_VERSION})")
 
 
@@ -532,6 +826,99 @@ def command_loop(cfg):
             log.warning("command poll failed (%s) — retrying in %ds", e, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Access events from the readers on this LAN
+# ---------------------------------------------------------------------------
+
+def start_event_listener(cfg, port):
+    """
+    Receive access events straight from the readers and pass them upstream.
+
+    Once this is running there is no internet-facing webhook for an agent-served site at all.
+    That dissolves a real problem rather than mitigating it: the public endpoint identified a
+    reader by source IP, with device_id as a fallback, and device_id is printed on the outside of
+    the device. Here the reader is on our own network and we authenticate the relay ourselves.
+
+    The reader posts to hostname:port/{path}/{kind}, so this serves /api/amico/notifications/dao
+    and its siblings. The payload is passed through untouched — parsing, idempotency and
+    broadcasting all stay in the one implementation on the backend that already gets them right.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _reply(self, code, body=b"{}"):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            kind = self.path.rstrip("/").rsplit("/", 1)[-1] or "dao"
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            source = self.client_address[0]
+
+            # Which reader this is. On our own LAN the source address is trustworthy in a way it
+            # never is across the internet — we are on the same broadcast domain as the device.
+            terminal_id = None
+            for tid, reader in (STATE.get("readers") or {}).items():
+                if reader.ip == source:
+                    terminal_id = tid
+                    break
+
+            if terminal_id is None:
+                log.warning("event from %s on this LAN, which is not a reader we manage — ignored", source)
+                return self._reply(404)
+
+            # Answer the reader immediately, then forward. A reader kept waiting on our uplink is
+            # a reader that may give up and drop the event, and it has already done its job.
+            self._reply(200)
+            threading.Thread(target=forward_event, args=(cfg, terminal_id, kind, raw), daemon=True).start()
+
+        def do_GET(self):
+            self._reply(200, b'{"havenz":"site agent event listener"}')
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("listening for reader events on port %d", port)
+    return server
+
+
+def forward_event(cfg, terminal_id, kind, raw):
+    """
+    Relay one reader event upstream, retrying briefly before giving up.
+
+    X-Terminal-Id names the reader; our hub key proves we are entitled to speak for it. The
+    backend checks the terminal belongs to this agent's property, so a compromised agent in one
+    building cannot invent access events against doors in another.
+    """
+    url = f"{cfg['api_url'].rstrip('/')}/api/amico/notifications/{kind}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hub-Key": cfg.get("hub_key", ""),
+        "X-Agent-Version": AGENT_VERSION,
+        "X-Terminal-Id": str(terminal_id),
+    }
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=raw, method="POST", headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+            log.info("relayed %s event from terminal %s", kind, terminal_id)
+            return
+        except Exception as e:  # noqa: BLE001
+            if attempt == 2:
+                # Not fatal, and deliberately not buffered here: the reader keeps its own access
+                # log and the backend's poller collects anything the webhook missed. The webhook
+                # makes events instant; the poller is what makes them survive.
+                log.warning("could not relay %s from terminal %s (%s) — the poller will "
+                            "collect it later", kind, terminal_id, e)
+                return
+            time.sleep(2 ** attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +1118,16 @@ def main():
         heartbeat(cfg)
         print(json.dumps(STATE["terminals"], indent=2))
         return
+
+    # Readers post their events to us directly, so this has to be up before we tell any of them to.
+    start_event_listener(cfg, int(cfg.get("webhook_port", 8100)))
+
+    # Learn the roster once at startup so an event arriving in the first few seconds can be
+    # attributed. Failure is not fatal — the command loop refreshes it.
+    try:
+        readers_for(cfg)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not load the reader list at startup (%s); will retry", e)
 
     # Commands run on their own thread. The heartbeat must keep reporting while a reader is being
     # slow, and an unlock must not wait behind a heartbeat — separate concerns, separate threads.

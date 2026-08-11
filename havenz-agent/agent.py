@@ -115,6 +115,118 @@ def backend_post(cfg, path, payload, timeout=20):
         return json.loads(raw) if raw else {}
 
 
+def backend_get(cfg, path, timeout=40):
+    """GET from the backend as this agent; return the parsed response."""
+    url = f"{cfg['api_url'].rstrip('/')}{path}"
+    req = urllib.request.Request(url, method="GET", headers=backend_headers(cfg))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+
+# ---------------------------------------------------------------------------
+# The reader
+# ---------------------------------------------------------------------------
+
+class ReaderError(Exception):
+    """The reader refused, or could not be reached. Carries the reader's own words."""
+
+
+class Reader:
+    """
+    A session-holding client for one HID Amico terminal on this LAN.
+
+    Holding the session here is the whole reason the agent keeps credentials. The alternative —
+    relaying a login handshake through the cloud before every call — turns a 50ms unlock into
+    several hundred milliseconds of round trips, on the one operation where somebody is standing
+    at a door waiting.
+
+    Firmware quirks belong in this class rather than in the backend, so they get fixed once:
+      - set_configuration rejects non-strings whatever the documentation says
+      - the monitor 'path' is a base, not a full path
+      - numbers come back quoted
+    """
+
+    def __init__(self, terminal_id, name, ip, username, password, timeout=10):
+        self.terminal_id = terminal_id
+        self.name = name
+        self.ip = ip
+        self._username = username
+        self._password = password
+        self._timeout = timeout
+        self._session = None
+
+    def _login(self):
+        body = json.dumps({"login": self._username, "password": self._password}).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://{self.ip}/hidlogin.fcgi", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise ReaderError(
+                f"login rejected by {self.ip}: HTTP {e.code} "
+                f"{e.read().decode('utf-8', 'replace')[:160]}") from None
+        except Exception as e:  # noqa: BLE001
+            raise ReaderError(f"cannot reach {self.ip}: {e}") from None
+
+        token = data.get("session")
+        if not token:
+            raise ReaderError(f"{self.ip} returned no session token")
+        self._session = token
+        return token
+
+    def call(self, endpoint, payload=None):
+        """
+        POST to a .fcgi endpoint, acquiring or refreshing the session as needed.
+
+        Retries exactly once on 401. A session expires on its own schedule and the first call
+        after that is the one that discovers it, so a single silent re-login is the difference
+        between working and failing every few hours for no visible reason.
+        """
+        for attempt in (1, 2):
+            session = self._session or self._login()
+            url = f"http://{self.ip}/{endpoint}?session={session}"
+            body = json.dumps(payload or {}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, method="POST", headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 1:
+                    self._session = None      # expired; re-login and try once more
+                    continue
+                raise ReaderError(
+                    f"{endpoint} on {self.ip}: HTTP {e.code} "
+                    f"{e.read().decode('utf-8', 'replace')[:160]}") from None
+            except Exception as e:  # noqa: BLE001
+                raise ReaderError(f"{endpoint} on {self.ip}: {e}") from None
+
+    # -- operations -------------------------------------------------------
+
+    def system_info(self):
+        data = self.call("system_information.fcgi")
+        return {
+            "deviceId": str(data.get("device_id") or ""),
+            # Observed empty on this firmware. Reported as-is rather than invented, so the gap
+            # stays visible instead of being papered over with a plausible-looking string.
+            "firmwareVersion": str(data.get("firmware_version") or ""),
+            "ipAddress": self.ip,
+        }
+
+    def open_door(self, door=1):
+        # Not an "open door" endpoint — the reader models this as triggering its security box.
+        # The parameters field is a string of key=value, not JSON, which is easy to get wrong and
+        # fails silently as a no-op rather than an error.
+        self.call("execute_actions.fcgi", {
+            "actions": [{"action": "sec_box", "parameters": f"door={int(door)}"}]
+        })
+        return {}
+
+
 def register(cfg_path, cfg, code):
     """
     Exchange a one-time pairing code for this site's key.
@@ -171,6 +283,7 @@ STATE = {
     "last_error": None,
     "terminals": [],
     "clock_skew_seconds": None,
+    "readers": {},
 }
 
 
@@ -271,6 +384,152 @@ def heartbeat_loop(cfg):
         except Exception as e:  # noqa: BLE001 — the loop must outlive every transport failure
             STATE["last_error"] = str(e)
             log.warning("heartbeat failed (%s) — retrying in %ds", e, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+# Command ids we have already carried out.
+#
+# Delivery is at-least-once by design: a lease whose result never reached the backend is retried,
+# and the retry is indistinguishable from a first delivery. Doing the work twice is harmless for a
+# user sync and unacceptable for an unlock, so the guarantee has to live here, at the only place
+# that knows whether the reader was actually touched.
+#
+# Bounded because this runs for months on a Pi and an unbounded set is a slow memory leak.
+_executed = {}
+EXECUTED_MEMORY = 500
+
+
+def _remember(command_id, result):
+    _executed[command_id] = result
+    if len(_executed) > EXECUTED_MEMORY:
+        for stale in list(_executed)[:len(_executed) - EXECUTED_MEMORY]:
+            _executed.pop(stale, None)
+
+
+def readers_for(cfg, force=False):
+    """
+    This site's readers, with their credentials, cached between calls.
+
+    Refetched when the backend mentions a terminal we do not know about, so a reader claimed in
+    Zhub becomes usable without restarting the add-on.
+    """
+    if force or not STATE.get("readers"):
+        rows = backend_get(cfg, "/api/agent/terminals")
+        STATE["readers"] = {
+            r["id"]: Reader(r["id"], r.get("name", "?"), r["ipAddress"], r["username"], r["password"])
+            for r in rows
+        }
+        log.info("hold credentials for %d reader(s)", len(STATE["readers"]))
+    return STATE["readers"]
+
+
+def execute(cfg, command):
+    """Carry out one command against its reader. Returns the JSON-serialisable result."""
+    kind = command.get("type")
+    terminal_id = command.get("terminalId")
+    payload = json.loads(command["payload"]) if command.get("payload") else {}
+
+    readers = readers_for(cfg)
+    reader = readers.get(terminal_id)
+    if reader is None:
+        reader = readers_for(cfg, force=True).get(terminal_id)   # newly claimed?
+    if reader is None:
+        raise ReaderError(f"no credentials held for terminal {terminal_id}")
+
+    if kind == "GetSystemInfo":
+        return reader.system_info()
+    if kind == "OpenDoor":
+        return reader.open_door(payload.get("door", 1))
+
+    raise ReaderError(f"this agent does not know how to '{kind}' (agent v{AGENT_VERSION})")
+
+
+def expired(command):
+    """True if the command's deadline has passed."""
+    deadline = parse_server_time(command.get("notValidAfter"))
+    return deadline is not None and time.time() > deadline
+
+
+def handle(cfg, command):
+    """Execute one command and report the outcome. Never raises."""
+    command_id = command.get("id")
+
+    # A repeat of something already done. Acknowledge with the original result rather than doing
+    # it again — the point of remembering.
+    if command_id in _executed:
+        log.info("command %s already executed; acknowledging without repeating", command_id)
+        report(cfg, command_id, True, _executed[command_id], None, 0)
+        return
+
+    # Too late to act on.
+    #
+    # Discarded rather than run, and this is the important half of the design: a door that opens by
+    # itself two minutes after someone asked is a security incident, not a late success. The
+    # decision is made here, on site, because a round trip to ask would itself be the delay.
+    if expired(command):
+        log.warning("discarding %s %s — it expired before we collected it",
+                    command.get("type"), command_id)
+        report(cfg, command_id, False, None, "expired before the agent collected it", 0)
+        return
+
+    started = time.time()
+    try:
+        result = execute(cfg, command)
+        elapsed = int((time.time() - started) * 1000)
+        _remember(command_id, result)
+        log.info("%s on terminal %s in %dms", command.get("type"), command.get("terminalId"), elapsed)
+        report(cfg, command_id, True, result, None, elapsed)
+    except ReaderError as e:
+        elapsed = int((time.time() - started) * 1000)
+        log.warning("%s failed after %dms: %s", command.get("type"), elapsed, e)
+        report(cfg, command_id, False, None, str(e), elapsed)
+    except Exception as e:  # noqa: BLE001
+        elapsed = int((time.time() - started) * 1000)
+        log.exception("%s raised unexpectedly", command.get("type"))
+        report(cfg, command_id, False, None, f"agent error: {e}", elapsed)
+
+
+def report(cfg, command_id, success, result, error, duration_ms):
+    """Send the outcome back. A failure to report is logged, not raised — the work is already done."""
+    try:
+        backend_post(cfg, f"/api/agent/commands/{command_id}/result", {
+            "success": success,
+            "result": None if result is None else json.dumps(result),
+            "error": error,
+            "durationMs": duration_ms,
+        }, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        # The backend will reap this as 'unknown', which is the honest outcome: the reader may
+        # well have acted and we could not say so.
+        log.warning("could not report the result of %s (%s)", command_id, e)
+
+
+def command_loop(cfg):
+    """Hold a long poll open, execute whatever arrives, repeat."""
+    wait = int(cfg.get("command_wait_seconds", 25))
+    backoff = BACKOFF_START_SECONDS
+
+    while True:
+        try:
+            batch = backend_get(cfg, f"/api/agent/commands?wait={wait}", timeout=wait + 15)
+            backoff = BACKOFF_START_SECONDS
+            for command in batch.get("commands") or []:
+                handle(cfg, command)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                log.error("no longer authorised to collect commands (HTTP %d)", e.code)
+                time.sleep(BACKOFF_MAX_SECONDS)
+            else:
+                log.warning("command poll failed (HTTP %d) — retrying in %ds", e.code, backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+        except Exception as e:  # noqa: BLE001 — this loop must outlive every transport failure
+            log.warning("command poll failed (%s) — retrying in %ds", e, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
 
@@ -473,6 +732,9 @@ def main():
         print(json.dumps(STATE["terminals"], indent=2))
         return
 
+    # Commands run on their own thread. The heartbeat must keep reporting while a reader is being
+    # slow, and an unlock must not wait behind a heartbeat — separate concerns, separate threads.
+    threading.Thread(target=command_loop, args=(cfg,), daemon=True).start()
     heartbeat_loop(cfg)
 
 

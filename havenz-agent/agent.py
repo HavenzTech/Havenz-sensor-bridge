@@ -46,9 +46,16 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("havenz-agent")
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Serves requests concurrently. Twenty readers can post at the same moment."""
+    daemon_threads = True
+    allow_reuse_address = True
 
 AGENT_VERSION = "0.1.0"
 
@@ -179,7 +186,11 @@ class Reader:
     def __init__(self, terminal_id, name, ip, username, password, timeout=10):
         self.terminal_id = terminal_id
         self.name = name
+        # May carry a port ("10.0.0.250:8080"). Real readers answer on 80, but a site behind a
+        # port-forward or a bank of simulated readers on one host will not, and every URL below
+        # interpolates this whole string so both work without a special case.
         self.ip = ip
+        self.host = ip.rsplit(":", 1)[0] if ":" in ip else ip
         self._username = username
         self._password = password
         self._timeout = timeout
@@ -718,7 +729,7 @@ def execute(cfg, command):
         # The reader posts to us, not to the internet. Resolved fresh each time rather than cached,
         # because a DHCP lease that moves the agent silently points all twenty readers at a dead
         # address and every event quietly falls back to polling.
-        return reader.configure_monitor(local_address_for(reader.ip), cfg.get("webhook_port", 8100))
+        return reader.configure_monitor(local_address_for(reader.host), cfg.get("webhook_port", 8100))
     if kind == "SyncClock":
         return reader.sync_clock(payload)
     if kind == "CreateUser":
@@ -771,21 +782,61 @@ def handle(cfg, command):
         report(cfg, command_id, False, None, "expired before the agent collected it", 0)
         return
 
+    terminal_id = command.get("terminalId")
+
+    # A reader we have already given up on for now. Failed immediately rather than after a full
+    # timeout, so a dead door cannot occupy a worker that the working doors need.
+    if breaker_is_open(terminal_id):
+        log.info("%s for terminal %s refused: that reader is marked down",
+                 command.get("type"), terminal_id)
+        report(cfg, command_id, False, None,
+               "the agent has marked this reader as unreachable; it will be retried shortly", 0)
+        return
+
     started = time.time()
     try:
         result = execute(cfg, command)
         elapsed = int((time.time() - started) * 1000)
         _remember(command_id, result)
-        log.info("%s on terminal %s in %dms", command.get("type"), command.get("terminalId"), elapsed)
+        breaker_record(terminal_id, True, command.get("type"))
+        log.info("%s on terminal %s in %dms", command.get("type"), terminal_id, elapsed)
         report(cfg, command_id, True, result, None, elapsed)
     except ReaderError as e:
         elapsed = int((time.time() - started) * 1000)
+        breaker_record(terminal_id, False, terminal_id)
         log.warning("%s failed after %dms: %s", command.get("type"), elapsed, e)
         report(cfg, command_id, False, None, str(e), elapsed)
     except Exception as e:  # noqa: BLE001
         elapsed = int((time.time() - started) * 1000)
         log.exception("%s raised unexpectedly", command.get("type"))
         report(cfg, command_id, False, None, f"agent error: {e}", elapsed)
+
+
+def run_in_parallel(cfg, commands, max_parallel):
+    """
+    Work several doors at once, never more than the cap.
+
+    A plain thread-per-command would be fine for twenty and wrong for two hundred; a fixed pool
+    keeps the memory and socket count predictable on a small box regardless of how big a backlog
+    arrives after an outage.
+    """
+    queue = list(commands)
+    index = threading.Lock()
+
+    def worker():
+        while True:
+            with index:
+                if not queue:
+                    return
+                command = queue.pop(0)
+            handle(cfg, command)
+
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(min(max_parallel, len(queue)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def report(cfg, command_id, success, result, error, duration_ms):
@@ -803,17 +854,64 @@ def report(cfg, command_id, success, result, error, duration_ms):
         log.warning("could not report the result of %s (%s)", command_id, e)
 
 
+# Per-terminal health, so one dead reader does not spoil the site.
+#
+# The failure that matters is not a reader that refuses a connection — that fails in milliseconds.
+# It is a reader that accepts the connection and then says nothing, costing a full timeout every
+# time it is asked. Twenty of those at a shift change is twenty workers blocked on a device that is
+# not going to answer, while the doors that do work wait behind them.
+#
+# So a reader that has failed repeatedly is marked down and its commands are failed at once, with a
+# message saying so. The backend keeps queueing for it, and one probe after the cooldown is enough
+# to bring it back — nothing has to be reset by hand.
+_breakers = {}
+BREAKER_TRIPS_AFTER = 3
+BREAKER_COOLDOWN_SECONDS = 60
+
+
+def breaker_is_open(terminal_id):
+    state = _breakers.get(terminal_id)
+    return bool(state and state["open_until"] > time.time())
+
+
+def breaker_record(terminal_id, ok, name=""):
+    state = _breakers.setdefault(terminal_id, {"failures": 0, "open_until": 0.0})
+    if ok:
+        if state["failures"] or state["open_until"]:
+            log.info("reader %s is answering again", name or terminal_id)
+        state["failures"] = 0
+        state["open_until"] = 0.0
+        return
+    state["failures"] += 1
+    if state["failures"] >= BREAKER_TRIPS_AFTER and not breaker_is_open(terminal_id):
+        state["open_until"] = time.time() + BREAKER_COOLDOWN_SECONDS
+        log.warning("reader %s has failed %d times — marking it down for %ds. Its work stays "
+                    "queued and the other doors carry on.",
+                    name or terminal_id, state["failures"], BREAKER_COOLDOWN_SECONDS)
+
+
 def command_loop(cfg):
     """Hold a long poll open, execute whatever arrives, repeat."""
     wait = int(cfg.get("command_wait_seconds", 25))
+    # Capped so twenty doors cannot put twenty simultaneous HTTP calls through a small box. The
+    # backend already allows at most one command per terminal in flight, so this bounds how many
+    # DOORS are worked at once, not how deep any one door's queue runs.
+    max_parallel = int(cfg.get("max_parallel_terminals", 8))
     backoff = BACKOFF_START_SECONDS
 
     while True:
         try:
             batch = backend_get(cfg, f"/api/agent/commands?wait={wait}", timeout=wait + 15)
             backoff = BACKOFF_START_SECONDS
-            for command in batch.get("commands") or []:
-                handle(cfg, command)
+            commands = batch.get("commands") or []
+
+            if len(commands) <= 1:
+                for command in commands:
+                    handle(cfg, command)
+            else:
+                # One command per terminal, so running them together cannot reorder anything for a
+                # given door — the ordering guarantee lives in the backend's dispatch.
+                run_in_parallel(cfg, commands, max_parallel)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 log.error("no longer authorised to collect commands (HTTP %d)", e.code)
@@ -865,7 +963,7 @@ def start_event_listener(cfg, port):
             # never is across the internet — we are on the same broadcast domain as the device.
             terminal_id = None
             for tid, reader in (STATE.get("readers") or {}).items():
-                if reader.ip == source:
+                if reader.host == source:
                     terminal_id = tid
                     break
 
@@ -881,7 +979,10 @@ def start_event_listener(cfg, port):
         def do_GET(self):
             self._reply(200, b'{"havenz":"site agent event listener"}')
 
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    # Threaded, because a plain HTTPServer accepts connections one at a time. With one reader that
+    # is invisible; with twenty posting at a shift change the twentieth waits behind the other
+    # nineteen, and a reader kept waiting may give up on an event it has already recorded.
+    server = ThreadedHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("listening for reader events on port %d", port)
     return server

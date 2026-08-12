@@ -57,7 +57,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 
 # How far our clock may differ from the backend's before we say so.
 #
@@ -80,6 +80,18 @@ BACKOFF_MAX_SECONDS = 60
 MONITOR_BASE_PATH = "api/amico/notifications"
 
 
+# Addresses that are ours but useless to a reader.
+#
+# Home Assistant runs add-ons on an internal Docker network at 172.30.32.0/23. An agent behind that
+# bridge asks the routing table for its source address and is truthfully told 172.30.x.x — an
+# address no reader on the site's LAN can route to. Configuring readers with it produces the worst
+# possible failure: every call succeeds, every event vanishes.
+#
+# The add-on declares host_network so this should not arise, but the check stays: if the answer is
+# ever one of these, something is wrong in a way that is silent otherwise, and it should be loud.
+UNREACHABLE_PREFIXES = ("172.30.", "172.17.", "127.")
+
+
 def local_address_for(reader_ip):
     """
     Our own address as this reader would see it.
@@ -92,11 +104,19 @@ def local_address_for(reader_ip):
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.connect((reader_ip, 80))
-        return probe.getsockname()[0]
+        address = probe.getsockname()[0]
     except Exception:  # noqa: BLE001
-        return socket.gethostbyname(socket.gethostname())
+        address = socket.gethostbyname(socket.gethostname())
     finally:
         probe.close()
+
+    if address.startswith(UNREACHABLE_PREFIXES):
+        raise ReaderError(
+            f"the agent's own address is {address}, which is a container network the reader cannot "
+            "reach. The add-on needs host_network enabled — without it the reader would be pointed "
+            "at an address that silently swallows every event.")
+
+    return address
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +630,24 @@ def heartbeat(cfg):
     STATE["terminals"] = terminals
     STATE["last_heartbeat_at"] = time.time()
     STATE["last_error"] = None
+
+    # A reader whose address has moved.
+    #
+    # Readers are on DHCP by default and leases do change — a router reboot, a lease expiry, a
+    # reader plugged into a different segment. Holding the address we were first told, forever,
+    # means that door silently stops working until somebody restarts the add-on, and the logs say
+    # only "cannot reach", naming an address nothing has answered on for hours.
+    #
+    # The heartbeat already carries each terminal's current address, so the correction is free.
+    held = STATE.get("readers") or {}
+    for terminal in terminals:
+        reader = held.get(terminal.get("id"))
+        if reader and terminal.get("ipAddress") and reader.ip != terminal["ipAddress"]:
+            log.info("reader %s has moved from %s to %s — reloading it",
+                     reader.name, reader.ip, terminal["ipAddress"])
+            held.pop(terminal["id"], None)
+            breaker_record(terminal["id"], True, reader.name)   # its old address failing is not its fault
+            STATE["readers"] = {}                               # refetched, with credentials, on next use
 
     server_epoch = parse_server_time(data.get("serverTimeUtc"))
     if server_epoch is not None:

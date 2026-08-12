@@ -1,5 +1,5 @@
 name: Havenz Site Agent
-version: "0.1.0"
+version: "0.2.0"
 slug: havenz_agent
 description: Lets Havenz reach this site's door terminals without opening the network.
 url: https://github.com/HavenzTech/Havenz-sensor-bridge
@@ -20,11 +20,23 @@ ingress_port: 8099
 panel_icon: mdi:door-closed-lock
 panel_title: Havenz Agent
 
-# A real listening port on the host, separate from ingress.
+# Share the host's network stack rather than sitting behind Docker's bridge.
 #
-# Readers POST their access events straight to the agent over the LAN once it is running. Home
-# Assistant's ingress is browser-proxied and authenticated — a door reader cannot post to it — so
-# the webhook needs a plain port of its own.
+# Required, not a convenience. The agent has to tell each reader where to send its events, and it
+# works that address out by asking the routing table what source address reaches that reader. Behind
+# the bridge the honest answer is the container's own address on Home Assistant's internal network
+# — 172.30.x.x — which no reader can route to. Observed on a real install: readers were configured
+# with 172.30.33.0 and every event went nowhere, reporting success at every step.
+#
+# It is also what reader discovery needs, since an ARP sweep of the site's LAN is meaningless from
+# inside a container network.
+host_network: true
+
+# Declared for documentation and for the Supervisor's port view. With host_network the listener
+# binds on the host directly; readers POST their access events here over the LAN.
+#
+# Home Assistant's ingress is browser-proxied and authenticated, so a door reader cannot post to it
+# — the webhook needs a plain port of its own.
 ports:
   8100/tcp: 8100
 ports_description:

@@ -57,7 +57,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.0"
 
 # How far our clock may differ from the backend's before we say so.
 #
@@ -133,6 +133,7 @@ def load_config(path):
     cfg.setdefault("heartbeat_interval_seconds", 30)
     cfg.setdefault("setup_port", 8099)
     cfg.setdefault("discovery_enabled", False)
+    cfg.setdefault("discovery_interval_seconds", 900)
     return cfg
 
 
@@ -707,6 +708,139 @@ def heartbeat_loop(cfg):
 
 
 # ---------------------------------------------------------------------------
+# Finding readers on this network
+# ---------------------------------------------------------------------------
+
+# HID's block of MAC addresses. Every Amico reader's address begins with this, so it is what
+# distinguishes one from the printers, phones and thermostats sharing the network.
+HID_OUI = "fc:52:ce"
+
+# How long to wait for each address to answer. Deliberately short: this is a sweep of every host on
+# a /24, and a reader that is up answers in single-digit milliseconds on its own LAN.
+PROBE_TIMEOUT = 0.35
+
+
+def own_address():
+    """This machine's address on the network it reaches the world through."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))       # no packet is sent; this only selects a route
+        return probe.getsockname()[0]
+    except Exception:  # noqa: BLE001
+        return socket.gethostbyname(socket.gethostname())
+    finally:
+        probe.close()
+
+
+def arp_table():
+    """
+    The kernel's address -> MAC table, as {ip: mac}.
+
+    Read from /proc/net/arp rather than shelling out to `arp`, which is not present in the add-on's
+    Alpine base. Only entries the kernel has actually resolved appear here, which is precisely what
+    we want: it is evidence something answered, not a guess.
+    """
+    entries = {}
+    try:
+        with open("/proc/net/arp", encoding="utf-8") as f:
+            next(f, None)                     # header
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 4 and parts[3] != "00:00:00:00:00:00":
+                    entries[parts[0]] = parts[3].lower()
+    except OSError:
+        pass                                  # not Linux, or no permission; discovery simply finds nothing
+    return entries
+
+
+def sweep(subnet_prefix, workers=32):
+    """
+    Touch every address on the /24 so the kernel learns their MAC addresses.
+
+    A TCP connect to port 80 rather than an ICMP ping: raw sockets need privileges the add-on does
+    not have, and a refused connection populates the ARP table just as well as an accepted one.
+    """
+    targets = [f"{subnet_prefix}.{n}" for n in range(1, 255)]
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            with lock:
+                if not targets:
+                    return
+                ip = targets.pop()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(PROBE_TIMEOUT)
+            try:
+                s.connect((ip, 80))
+            except Exception:  # noqa: BLE001 — refused still teaches the kernel the MAC
+                pass
+            finally:
+                s.close()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def discover_readers(cfg):
+    """
+    Look for HID readers on this network and report what was found.
+
+    Finding a reader does nothing to it. Nothing is configured, nothing is adopted, no credentials
+    are tried — the candidate is reported and sits inert until a person claims it in Zhub. Scanning
+    identifies hardware; it does not confer trust, and configuring a device found on somebody's
+    network without being asked is how you lose an account.
+
+    Off unless a site enables it, for the same reason.
+    """
+    if not cfg.get("discovery_enabled"):
+        return []
+
+    address = own_address()
+    prefix = address.rsplit(".", 1)[0]
+    log.info("scanning %s.0/24 for readers", prefix)
+
+    sweep(prefix)
+    candidates = [
+        {"mac": mac, "ipAddress": ip}
+        for ip, mac in sorted(arp_table().items())
+        if mac.startswith(HID_OUI)
+    ]
+
+    if not candidates:
+        log.info("no readers found on %s.0/24", prefix)
+        return []
+
+    log.info("found %d reader(s): %s", len(candidates),
+             ", ".join(c["ipAddress"] for c in candidates))
+    try:
+        backend_post(cfg, "/api/agent/discovered", {"readers": candidates})
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not report discovered readers (%s)", e)
+    return candidates
+
+
+def discovery_loop(cfg):
+    """
+    Sweep on a slow cycle.
+
+    Slow because the point is not to notice a reader within seconds — it is to notice one that has
+    been plugged in since yesterday, and to re-find one whose address has moved. A sweep every few
+    minutes across a customer's network would be rude and pointless in equal measure.
+    """
+    interval = int(cfg.get("discovery_interval_seconds", 900))
+    while True:
+        try:
+            discover_readers(cfg)
+        except Exception as e:  # noqa: BLE001
+            log.warning("discovery sweep failed (%s)", e)
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -1271,6 +1405,11 @@ def main():
     # Commands run on their own thread. The heartbeat must keep reporting while a reader is being
     # slow, and an unlock must not wait behind a heartbeat — separate concerns, separate threads.
     threading.Thread(target=command_loop, args=(cfg,), daemon=True).start()
+
+    # Discovery gets its own thread too: a sweep of 254 addresses takes seconds, and no door should
+    # wait on it.
+    if cfg.get("discovery_enabled"):
+        threading.Thread(target=discovery_loop, args=(cfg,), daemon=True).start()
     heartbeat_loop(cfg)
 
 

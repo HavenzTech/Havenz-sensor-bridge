@@ -1,5 +1,5 @@
 name: Havenz Site Agent
-version: "0.3.0"
+version: "0.3.1"
 slug: havenz_agent
 description: Lets Havenz reach this site's door terminals without opening the network.
 url: https://github.com/HavenzTech/Havenz-sensor-bridge

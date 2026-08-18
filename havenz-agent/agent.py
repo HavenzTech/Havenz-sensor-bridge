@@ -52,12 +52,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("havenz-agent")
 
 
+def _prefer_ipv4():
+    """
+    Try IPv4 addresses before IPv6 for every outbound call.
+
+    The backend resolves to eight IPv6 addresses and eight IPv4 ones. Python tries them in the
+    order the resolver returns, giving each the full socket timeout, and does not do Happy
+    Eyeballs. On a network whose IPv6 is advertised but does not carry traffic — a VirtualBox
+    guest, plenty of sites — every call therefore waits out eight dead routes before it reaches a
+    working one. Measured here: 8 x 40s = 320s to fetch a reader list, 8 x 20s = 166s to pair.
+
+    That is not slowness, it is a broken agent. Unlock commands expire after ten seconds and
+    command leases after forty-five, so a door opens only if the whole round trip beats a deadline
+    the agent is already minutes past. It looks exactly like an agent that is offline, which is how
+    it was first misread.
+
+    Sorting rather than filtering: an IPv6-only site still works, it just tries IPv4 first and
+    falls through. The cost there is a few failed connects on a network where IPv4 genuinely does
+    not exist; the cost of the reverse is every door in the building.
+    """
+    original = socket.getaddrinfo
+
+    def ipv4_first(host, port, family=0, type=0, proto=0, flags=0):
+        results = original(host, port, family, type, proto, flags)
+        return sorted(results, key=lambda entry: 0 if entry[0] == socket.AF_INET else 1)
+
+    socket.getaddrinfo = ipv4_first
+
+
+_prefer_ipv4()
+
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Serves requests concurrently. Twenty readers can post at the same moment."""
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.3.1"
 
 # How far our clock may differ from the backend's before we say so.
 #

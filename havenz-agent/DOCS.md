@@ -34,6 +34,11 @@ That is the whole install. One code, once, for the whole site — not one per do
 | `heartbeat_interval_seconds` | `30` | How often the agent reports in. Havenz raises an alert if it goes quiet. |
 | `discovery_enabled` | `false` | Lets the agent look for door readers on this network so nobody has to type in twenty IP addresses. Off by default — see below. |
 
+The agent also keeps a small record at `/data/executed.json` of the work it has already carried
+out, so that restarting it — for an update, after a power cut — cannot make it repeat a door it
+has already opened. It holds about a week, prunes itself, and needs no attention. Deleting it is
+harmless but pointless; the only thing it costs you is that protection for a few minutes.
+
 ### About discovery
 
 When enabled, the agent looks for HID readers on the local network and reports what it finds to

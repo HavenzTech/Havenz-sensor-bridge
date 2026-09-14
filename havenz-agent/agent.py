@@ -38,6 +38,7 @@ Pure standard library (no pip installs). Run:  python3 agent.py config.json [--r
 import base64
 import json
 import logging
+import os
 import socket
 import sys
 import threading
@@ -88,7 +89,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.3.1"
+AGENT_VERSION = "0.4.0"
 
 # How far our clock may differ from the backend's before we say so.
 #
@@ -165,6 +166,9 @@ def load_config(path):
     cfg.setdefault("setup_port", 8099)
     cfg.setdefault("discovery_enabled", False)
     cfg.setdefault("discovery_interval_seconds", 900)
+    # Which doors this agent has already opened, kept where a restart cannot lose it. /data is the
+    # add-on's own persistent volume — the same place the hub key lives.
+    cfg.setdefault("executed_store_path", "/data/executed.json")
     return cfg
 
 
@@ -875,23 +879,159 @@ def discovery_loop(cfg):
 # Commands
 # ---------------------------------------------------------------------------
 
-# Command ids we have already carried out.
+# What we have already carried out.
 #
 # Delivery is at-least-once by design: a lease whose result never reached the backend is retried,
 # and the retry is indistinguishable from a first delivery. Doing the work twice is harmless for a
 # user sync and unacceptable for an unlock, so the guarantee has to live here, at the only place
 # that knows whether the reader was actually touched.
 #
-# Bounded because this runs for months on a Pi and an unbounded set is a slow memory leak.
+# Two things are remembered per piece of work:
+#
+#   the command id — this particular delivery, and
+#   the intent id  — what the person actually asked for, one tap on an unlock button.
+#
+# The intent is the one that matters. A command id changes when the backend re-mints a command for
+# the same tap, so deduplicating on it alone leaves the exact hole this is meant to close: a retry
+# arrives under a new id and the door opens a second time.
+#
+# And it is kept on disk. The set used to be memory-only, so an agent restarted between opening a
+# door and reporting it came back with no memory of the door it had just opened — the backend
+# retried, and the door opened again. A Pi restarts: on an update, on a power blip, on a crash. The
+# add-on already owns /data, so persisting is cheap and the gap is not.
+#
+# Bounded, because this runs for months on a small box: the newest EXECUTED_MAX entries, and
+# nothing older than EXECUTED_TTL_SECONDS. A week is far longer than any command's own lifetime
+# (the longest is two minutes), so the bound can never discard something still in play.
 _executed = {}
-EXECUTED_MEMORY = 500
+_executed_lock = threading.Lock()
+
+EXECUTED_MAX = 5000
+EXECUTED_TTL_SECONDS = 7 * 24 * 3600
+EXECUTED_STORE_VERSION = 1
 
 
-def _remember(command_id, result):
-    _executed[command_id] = result
-    if len(_executed) > EXECUTED_MEMORY:
-        for stale in list(_executed)[:len(_executed) - EXECUTED_MEMORY]:
-            _executed.pop(stale, None)
+def executed_store_path(cfg):
+    """Where the executed set lives. /data survives restarts and add-on updates; /tmp does not."""
+    return cfg.get("executed_store_path") or "/data/executed.json"
+
+
+def executed_store_load(cfg):
+    """
+    Re-read what this agent did before it restarted.
+
+    Never raises. A store that is missing, truncated by a power cut, or written by a newer version
+    leaves the agent exactly where it was before this existed — deduplicating in memory only — and
+    that is strictly better than refusing to start. It is logged loudly, because silently forgetting
+    which doors you opened is the failure this whole file is about.
+    """
+    path = executed_store_path(cfg)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except FileNotFoundError:
+        log.info("no executed-command store at %s yet; starting with an empty one", path)
+        return 0
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not read the executed-command store at %s (%s); "
+                    "starting empty — a command in flight across this restart may run twice", path, e)
+        return 0
+
+    if not isinstance(stored, dict) or stored.get("version") != EXECUTED_STORE_VERSION:
+        log.warning("executed-command store at %s is version %s, not %s; ignoring it",
+                    path, (stored or {}).get("version") if isinstance(stored, dict) else "?",
+                    EXECUTED_STORE_VERSION)
+        return 0
+
+    cutoff = time.time() - EXECUTED_TTL_SECONDS
+    loaded = {}
+    for entry in stored.get("entries") or []:
+        try:
+            key = entry["key"]
+            at = float(entry.get("at") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if not key or at < cutoff:
+            continue
+        loaded[key] = {"at": at, "result": entry.get("result")}
+
+    with _executed_lock:
+        _executed.clear()
+        _executed.update(loaded)
+
+    log.info("recovered %d executed command(s) from %s", len(loaded), path)
+    return len(loaded)
+
+
+def _executed_prune_locked():
+    """Drop anything past its week, then anything past the count. Caller holds the lock."""
+    cutoff = time.time() - EXECUTED_TTL_SECONDS
+    for key in [k for k, v in _executed.items() if v["at"] < cutoff]:
+        _executed.pop(key, None)
+
+    if len(_executed) > EXECUTED_MAX:
+        oldest = sorted(_executed.items(), key=lambda kv: kv[1]["at"])[:len(_executed) - EXECUTED_MAX]
+        for key, _ in oldest:
+            _executed.pop(key, None)
+
+
+def _executed_save_locked(cfg):
+    """
+    Write the set out atomically. Caller holds the lock.
+
+    Temp file plus replace, because the alternative — truncating the real file and writing into it
+    — has a window where a power cut leaves an empty store, which is worse than no store at all: it
+    reads as "this agent has never opened a door".
+
+    A failure to write is logged, never raised. The work is already done; losing the record of it
+    costs a possible repeat after a restart, while refusing to acknowledge a door we just opened
+    costs a retry immediately.
+    """
+    path = executed_store_path(cfg)
+    payload = {
+        "version": EXECUTED_STORE_VERSION,
+        "entries": [{"key": k, "at": v["at"], "result": v["result"]} for k, v in _executed.items()],
+    }
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not persist the executed-command store to %s (%s)", path, e)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _remember(cfg, command_id, intent_id, result):
+    """Record that this command — and the intent behind it — has been carried out."""
+    now = time.time()
+    with _executed_lock:
+        for key in (command_id, intent_id):
+            if key:
+                _executed[key] = {"at": now, "result": result}
+        _executed_prune_locked()
+        _executed_save_locked(cfg)
+
+
+def _already_executed(command_id, intent_id):
+    """
+    The stored result if this work is already done, else None.
+
+    The intent is checked as well as the command id, so a second command minted for the same tap is
+    recognised as the repeat it is. Returns a two-tuple so the caller can say WHICH matched — the
+    log line "already executed" is useless when a door opens twice and nobody can tell whether the
+    protection was even consulted.
+    """
+    with _executed_lock:
+        for key, kind in ((command_id, "command"), (intent_id, "intent")):
+            if key and key in _executed:
+                return _executed[key]["result"], kind
+    return None, None
 
 
 def readers_for(cfg, force=False):
@@ -966,12 +1106,19 @@ def expired(command):
 def handle(cfg, command):
     """Execute one command and report the outcome. Never raises."""
     command_id = command.get("id")
+    intent_id = command.get("intentId")
 
-    # A repeat of something already done. Acknowledge with the original result rather than doing
-    # it again — the point of remembering.
-    if command_id in _executed:
-        log.info("command %s already executed; acknowledging without repeating", command_id)
-        report(cfg, command_id, True, _executed[command_id], None, 0)
+    # A repeat of something already done. Acknowledge with the original result rather than doing it
+    # again — the point of remembering.
+    #
+    # Matching on the intent as well as the command id is what closes the real hole: the backend
+    # can re-mint a command for the same tap, and a repeat under a new id used to be
+    # indistinguishable from someone asking a second time.
+    done, matched = _already_executed(command_id, intent_id)
+    if matched:
+        log.info("%s %s already executed (matched by %s); acknowledging without repeating",
+                 command.get("type"), command_id, matched)
+        report(cfg, command_id, True, done, None, 0)
         return
 
     # Too late to act on.
@@ -1000,7 +1147,7 @@ def handle(cfg, command):
     try:
         result = execute(cfg, command)
         elapsed = int((time.time() - started) * 1000)
-        _remember(command_id, result)
+        _remember(cfg, command_id, intent_id, result)
         breaker_record(terminal_id, True, command.get("type"))
         log.info("%s on terminal %s in %dms", command.get("type"), terminal_id, elapsed)
         report(cfg, command_id, True, result, None, elapsed)
@@ -1417,6 +1564,10 @@ def main():
 
     log.info("Havenz site agent v%s -> %s (heartbeat every %ss)",
              AGENT_VERSION, cfg["api_url"], cfg["heartbeat_interval_seconds"])
+
+    # Before anything can be leased. An agent that starts taking commands before it remembers what
+    # it did last time is exactly the agent that opens a door twice after a restart.
+    executed_store_load(cfg)
 
     if "--once" in args:
         heartbeat(cfg)

@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -50,7 +51,7 @@ JUNK_DEVICE_CLASSES = {
 # Entity ids that are clearly the hub/host itself, never a user sensor.
 INFRA_ENTITY_HINTS = ("raspberry_pi", "_supervisor", "home_assistant", "hacs", "backup")
 
-AGENT_VERSION = "1.3.2"
+AGENT_VERSION = "1.4.0"
 
 # While a pairing window is open, poll this fast so a joining sensor appears within seconds.
 # The grace period covers the ZHA interview + first attribute report after the window closes.
@@ -382,23 +383,54 @@ def combined_mappings(cfg, dynamic):
     return out
 
 
+# States Home Assistant uses to say "this entity is not there right now". They are posted as
+# explicit "source unavailable" rows rather than skipped, so the cloud KNOWS the source went away
+# instead of inferring it from silence a quarter of an hour later.
+UNAVAILABLE_STATES = ("unavailable", "unknown")
+
+
+def _provenance(st):
+    """
+    The source's own clocks, straight from the HA state object (ISO-8601 with offset, passed
+    through untouched):
+
+      sourceObservedAt  last_reported when the core has it, else last_updated. last_reported is
+                        the only field that moves when a sensor re-reports an UNCHANGED value;
+                        last_updated only moves when state or attributes differ, so a steady
+                        sensor would look frozen without it.
+      sourceChangedAt   last_changed - when the value itself last changed.
+
+    Either is left out when the state carries no such field (a very old core, or a hand-made state).
+    """
+    out = {}
+    observed = st.get("last_reported") or st.get("last_updated")
+    if observed:
+        out["sourceObservedAt"] = observed
+    changed = st.get("last_changed")
+    if changed:
+        out["sourceChangedAt"] = changed
+    return out
+
+
 def build_readings(mappings, states):
-    """Turn each mapping into a normalized reading using the already-fetched states."""
+    """
+    Turn each mapping into a normalized reading using the already-fetched states.
+
+    Every reading now carries where its number came from and when: the source's own observation
+    time, the gateway's clock at this poll, and whether the source was available at all. A dead
+    sensor whose last number Home Assistant keeps repeating therefore posts the same
+    sourceObservedAt on every cycle, and the cloud can see it has not really reported since.
+    """
     readings = []
+    received = datetime.now(timezone.utc).isoformat()  # one clock for the whole cycle
     for m in mappings:
         st = states.get(m["entity"])
         if not st:
             continue
-        raw = st.get("state")
-        if raw in (None, "unknown", "unavailable", ""):
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            value = BINARY_STATES.get(str(raw).strip().lower())
-            if value is None:
-                continue  # not a number and not a known binary word — nothing to report
-        reading = {"deviceKey": m["deviceKey"], "metricType": m["metricType"], "value": value}
+
+        reading = {"deviceKey": m["deviceKey"], "metricType": m["metricType"],
+                   "gatewayReceivedAt": received, "sourceAvailable": True}
+        reading.update(_provenance(st))
         unit = m.get("unit") or st.get("attributes", {}).get("unit_of_measurement")
         if unit:
             reading["unit"] = unit
@@ -406,6 +438,21 @@ def build_readings(mappings, states):
             reading["thresholdMin"] = m["thresholdMin"]
         if m.get("thresholdMax") is not None:
             reading["thresholdMax"] = m["thresholdMax"]
+
+        raw = st.get("state")
+        if raw in (None, "") or str(raw).strip().lower() in UNAVAILABLE_STATES:
+            # The source said gone. No value - that is the point - but the row goes up.
+            reading["sourceAvailable"] = False
+            readings.append(reading)
+            continue
+
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = BINARY_STATES.get(str(raw).strip().lower())
+            if value is None:
+                continue  # not a number and not a known binary word - nothing to report
+        reading["value"] = value
         readings.append(reading)
     return readings
 

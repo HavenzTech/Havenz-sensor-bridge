@@ -67,3 +67,15 @@ The log should then read `discovery: reported N entities` and the gateway goes O
 - It reaches Home Assistant through the **Supervisor**, so you never create a long-lived token.
 - Its key and settings are stored in the add-on's `/data`, surviving restarts and updates.
 - To move it to a different property, **revoke** it in the Havenz app and pair again with a new code.
+
+## What each reading carries (1.4.0)
+
+Every reading the gateway posts now says when it was actually measured, not just what the number
+was. It forwards Home Assistant's own timestamps for the entity (`last_reported` when the core has
+it, else `last_updated`, plus `last_changed`), stamps the gateway's clock at the poll, and says
+whether Home Assistant reported the entity as available. An entity Home Assistant marks
+`unavailable` or `unknown` is posted as exactly that, with no value, instead of being skipped -
+so the cloud knows the sensor went away the moment it did, rather than guessing from silence a
+quarter of an hour later. A sensor whose battery has died and whose last number Home Assistant
+keeps repeating therefore shows as "repeated" and then stale within its own reporting interval on
+every Havenz screen. Nothing to configure; older backends ignore the extra fields.

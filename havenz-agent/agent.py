@@ -36,6 +36,7 @@ Pure standard library (no pip installs). Run:  python3 agent.py config.json [--r
 """
 
 import base64
+import http.client
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -89,7 +91,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.5.0"
 
 # How far our clock may differ from the backend's before we say so.
 #
@@ -169,6 +171,12 @@ def load_config(path):
     # Which doors this agent has already opened, kept where a restart cannot lose it. /data is the
     # add-on's own persistent volume — the same place the hub key lives.
     cfg.setdefault("executed_store_path", "/data/executed.json")
+    # Reader events wait here, on disk, until Havenz has them. Written before the reader is
+    # answered, so neither a restart nor an uplink outage can lose one.
+    cfg.setdefault("event_queue_path", "/data/events.jsonl")
+    # Which address is which door - no credentials - so an event arriving while Havenz is
+    # unreachable can still be attributed after a restart.
+    cfg.setdefault("roster_path", "/data/roster.json")
     return cfg
 
 
@@ -222,6 +230,43 @@ def backend_get(cfg, path, timeout=40):
 
 class ReaderError(Exception):
     """The reader refused, or could not be reached. Carries the reader's own words."""
+
+
+class ReaderOutcomeUnknown(ReaderError):
+    """
+    The request went to the reader and no answer came back.
+
+    Not the same thing as a failure, and for a door the difference is the whole point. A reader
+    that accepts "open" and is then slow to say so - or drops the connection - has very possibly
+    opened the door. Reporting that as "failed" tells the person at the door to tap again, and
+    tapping again is how a door opens twice. Seen on the bench: the reader opened, answered after
+    the ten-second timeout, and the tap was recorded as "could not reach terminal".
+
+    A subclass, so every caller that only cares that the work did not complete still catches it
+    as a ReaderError; only an unlock treats it differently.
+    """
+
+
+def _may_have_reached_the_reader(error):
+    """
+    True when a transport error leaves it open whether the reader acted.
+
+    A refused connection, an unroutable address or a name that does not resolve never reached the
+    reader: that is a failure. A timeout, or a connection that was accepted and then dropped or
+    reset, may well have - the command was on the wire. urllib does not say whether a timeout hit
+    while connecting or while waiting for the reply, so every timeout is treated as "may have": for
+    a door, wrongly saying "check the door" costs a glance; wrongly saying "failed" costs a second
+    opening.
+    """
+    reason = getattr(error, "reason", error)
+    for e in (error, reason):
+        if isinstance(e, (ConnectionRefusedError, socket.gaierror)):
+            return False
+        if isinstance(e, (socket.timeout, TimeoutError, http.client.RemoteDisconnected,
+                          http.client.IncompleteRead, ConnectionResetError, ConnectionAbortedError,
+                          BrokenPipeError)):
+            return True
+    return "timed out" in str(error).lower()
 
 
 class Reader:
@@ -299,6 +344,8 @@ class Reader:
                     f"{endpoint} on {self.ip}: HTTP {e.code} "
                     f"{e.read().decode('utf-8', 'replace')[:160]}") from None
             except Exception as e:  # noqa: BLE001
+                if _may_have_reached_the_reader(e):
+                    raise ReaderOutcomeUnknown(f"{endpoint} on {self.ip}: {e}") from None
                 raise ReaderError(f"{endpoint} on {self.ip}: {e}") from None
 
     # -- operations -------------------------------------------------------
@@ -523,13 +570,27 @@ class Reader:
 
     # -- events -----------------------------------------------------------
 
-    def access_logs(self):
+    def access_logs(self, after_log_id=None):
         """
-        Every access-log row the reader is holding.
+        The reader's access-log rows - all of them, or only those after a mark.
 
         Timestamps are passed up untouched. The reader runs on local time and reports that wall
         clock as if it were UTC; undoing that is the backend's job, in the one place that already
         does it correctly.
+
+        `after_log_id` is the backend's high-water mark: the highest row it already holds (less an
+        overlap it chooses). Havenz reads this log every thirty seconds as the safety net under the
+        live events, and without a mark every one of those reads hauled the reader's entire history
+        across the site's uplink to be thrown away row by row.
+
+        The mark is the backend's, not ours, on purpose: only the backend knows what it has
+        durably stored. This agent keeps no polling state, so restarting it can neither lose rows
+        nor replay them.
+
+        One trap. A reader that has been factory reset or replaced starts its log again at 1. Its
+        highest id is then BELOW the mark, and "nothing newer than 5120" would hide everything it
+        records until its counter climbed past 5120 - weeks, silently. So when the reader's highest
+        id is below the mark, everything is returned and the result says so.
         """
         data = self.call("load_objects.fcgi", {"object": "access_logs"})
         entries = []
@@ -544,7 +605,7 @@ class Reader:
                 })
             except (TypeError, ValueError):
                 continue   # one malformed row must not cost us the rest of the log
-        return {"entries": entries}
+        return apply_log_cursor(entries, after_log_id)
 
     def registration_map(self):
         """
@@ -561,6 +622,26 @@ class Reader:
             if row.get("id") is not None and registration:
                 mapping[str(row["id"])] = str(registration)
         return {"map": mapping}
+
+
+def apply_log_cursor(entries, after_log_id):
+    """Rows above the mark - or all of them, flagged, when the reader's log has started again."""
+    reader_max = max((e["id"] for e in entries), default=None)
+    try:
+        mark = int(after_log_id) if after_log_id is not None else 0
+    except (TypeError, ValueError):
+        mark = 0
+
+    restarted = False
+    if mark > 0 and reader_max is not None:
+        if reader_max < mark:
+            restarted = True
+            log.warning("the reader's access log has started again (its highest row is %d, the "
+                        "backend holds %d) - returning all of it", reader_max, mark)
+        else:
+            entries = [e for e in entries if e["id"] > mark]
+
+    return {"entries": entries, "readerMaxLogId": reader_max, "logRestarted": restarted}
 
 
 def register(cfg_path, cfg, code):
@@ -1034,6 +1115,17 @@ def _already_executed(command_id, intent_id):
     return None, None
 
 
+# Commands that only READ the reader. Running one twice is harmless, so they are not remembered.
+#
+# They used to be, results and all - and the access log is read every thirty seconds per door, so
+# the executed store filled with thousands of copies of reader logs and was rewritten in full after
+# every command. On a Pi's SD card that is wear and latency spent protecting nothing: the set exists
+# so that a DOOR is not opened twice.
+READ_ONLY_COMMANDS = frozenset({
+    "GetSystemInfo", "GetAccessLogs", "FindTerminalUserId", "GetUserRegistrationMap",
+})
+
+
 def readers_for(cfg, force=False):
     """
     This site's readers, with their credentials, cached between calls.
@@ -1048,6 +1140,7 @@ def readers_for(cfg, force=False):
             for r in rows
         }
         log.info("hold credentials for %d reader(s)", len(STATE["readers"]))
+        roster_save(cfg, {r.host: tid for tid, r in STATE["readers"].items()})
     return STATE["readers"]
 
 
@@ -1086,7 +1179,7 @@ def execute(cfg, command):
     if kind == "StartRemoteEnrollment":
         return reader.remote_enroll(payload)
     if kind == "GetAccessLogs":
-        return reader.access_logs()
+        return reader.access_logs(payload.get("afterLogId"))
     if kind == "FindTerminalUserId":
         Reader._require(payload, "FindTerminalUserId", "registration")
         return {"terminalUserId": reader.find_user_id(payload["registration"]) or 0}
@@ -1147,10 +1240,27 @@ def handle(cfg, command):
     try:
         result = execute(cfg, command)
         elapsed = int((time.time() - started) * 1000)
-        _remember(cfg, command_id, intent_id, result)
+        if command.get("type") not in READ_ONLY_COMMANDS:
+            _remember(cfg, command_id, intent_id, result)
         breaker_record(terminal_id, True, command.get("type"))
         log.info("%s on terminal %s in %dms", command.get("type"), terminal_id, elapsed)
         report(cfg, command_id, True, result, None, elapsed)
+    except ReaderOutcomeUnknown as e:
+        elapsed = int((time.time() - started) * 1000)
+        breaker_record(terminal_id, False, terminal_id)
+        if command.get("type") == "OpenDoor":
+            # The unlock reached the reader and the reader never answered. It may well have opened
+            # the door, so this is reported as UNKNOWN, never as failed: "failed" invites a second
+            # tap. Not remembered as executed either - we do not know that it was.
+            log.warning("OpenDoor on terminal %s: no answer from the reader after %dms (%s) - "
+                        "reporting the outcome as UNKNOWN; the door may have opened",
+                        terminal_id, elapsed, e)
+            report(cfg, command_id, False, None,
+                   f"{e} - the unlock was sent and the reader did not answer, so the door may have opened",
+                   elapsed, outcome="unknown")
+        else:
+            log.warning("%s failed after %dms: %s", command.get("type"), elapsed, e)
+            report(cfg, command_id, False, None, str(e), elapsed)
     except ReaderError as e:
         elapsed = int((time.time() - started) * 1000)
         breaker_record(terminal_id, False, terminal_id)
@@ -1189,15 +1299,23 @@ def run_in_parallel(cfg, commands, max_parallel):
         t.join()
 
 
-def report(cfg, command_id, success, result, error, duration_ms):
-    """Send the outcome back. A failure to report is logged, not raised — the work is already done."""
+def report(cfg, command_id, success, result, error, duration_ms, outcome=None):
+    """
+    Send the outcome back. A failure to report is logged, not raised — the work is already done.
+
+    `outcome="unknown"` says the command reached the reader and nothing came back. A backend that
+    does not know the field ignores it and records a failure, exactly as before.
+    """
+    body = {
+        "success": success,
+        "result": None if result is None else json.dumps(result),
+        "error": error,
+        "durationMs": duration_ms,
+    }
+    if outcome:
+        body["outcome"] = outcome
     try:
-        backend_post(cfg, f"/api/agent/commands/{command_id}/result", {
-            "success": success,
-            "result": None if result is None else json.dumps(result),
-            "error": error,
-            "durationMs": duration_ms,
-        }, timeout=15)
+        backend_post(cfg, f"/api/agent/commands/{command_id}/result", body, timeout=15)
     except Exception as e:  # noqa: BLE001
         # The backend will reap this as 'unknown', which is the honest outcome: the reader may
         # well have acted and we could not say so.
@@ -1280,9 +1398,521 @@ def command_loop(cfg):
 # Access events from the readers on this LAN
 # ---------------------------------------------------------------------------
 
-def start_event_listener(cfg, port):
+# Which address is which door, kept on disk.
+#
+# The listener works out which reader posted an event from its source address, and it learns the
+# addresses from Havenz. If the agent restarts while Havenz is unreachable it has no roster, and
+# every event in that window used to be refused as "not a reader we manage" - lost at exactly the
+# moment the queue below exists for. Addresses and terminal ids only; never a credential.
+def roster_path(cfg):
+    return cfg.get("roster_path") or "/data/roster.json"
+
+
+def roster_save(cfg, hosts):
+    path = roster_path(cfg)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "hosts": hosts}, f, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not save the reader roster to %s (%s)", path, e)
+    STATE["roster_hosts"] = dict(hosts)
+
+
+def roster_load(cfg):
+    try:
+        with open(roster_path(cfg), "r", encoding="utf-8") as f:
+            stored = json.load(f)
+        hosts = stored.get("hosts") if isinstance(stored, dict) else None
+        STATE["roster_hosts"] = dict(hosts) if isinstance(hosts, dict) else {}
+    except FileNotFoundError:
+        STATE["roster_hosts"] = {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not read the saved reader roster (%s); events cannot be attributed "
+                    "until Havenz is reachable", e)
+        STATE["roster_hosts"] = {}
+    return STATE["roster_hosts"]
+
+
+def terminal_for_source(source):
+    """The terminal id a LAN address belongs to, from the live roster or the saved one."""
+    for tid, reader in (STATE.get("readers") or {}).items():
+        if reader.host == source:
+            return tid
+    return (STATE.get("roster_hosts") or {}).get(source)
+
+
+# ---------------------------------------------------------------------------
+# The event queue
+# ---------------------------------------------------------------------------
+#
+# A reader posts an event once. It used to be answered 200 and the event then lived in a thread
+# that tried Havenz three times over three seconds and gave up - so a restart, or an uplink that
+# blinked for ten seconds, lost it. The reader's own log and the backend's poller recover SOME of
+# what is missed, depending on how long the reader keeps its log and what kind of event it was;
+# "nothing is lost" was a hope, not a property.
+#
+# Now the order is: write it to disk, THEN answer the reader, then deliver from the disk, and keep
+# trying until Havenz has it. The agent has custody of the event from the moment it says 200, so it
+# must be able to prove it still has it after a power cut.
+#
+# The file is an append-only journal, one JSON object per line:
+#
+#   {"v":1,"op":"put","id":...,"terminalId":...,"kind":"dao","receivedAt":...,"body":"<base64>"}
+#   {"v":1,"op":"ack","id":...,"at":...}                 Havenz has it
+#   {"v":1,"op":"drop","id":...,"at":...,"reason":...}    given up on, and why
+#
+# Append-only because appending is the one write a power cut cannot turn into a lost file: the worst
+# case is a torn last line, which is ignored. Pending = every put with no ack or drop after it.
+# Rewritten (temp file + replace, never truncated in place) on start and every so often, so it
+# stays the size of what is actually waiting.
+
+EVENT_QUEUE_VERSION = 1
+EVENT_MAX_PENDING = 10000
+EVENT_MAX_BYTES = 64 * 1024 * 1024
+EVENT_MAX_AGE_SECONDS = 7 * 24 * 3600
+EVENT_MAX_BODY_BYTES = 4 * 1024 * 1024
+EVENT_COMPACT_AFTER = 500
+EVENT_DELIVERY_WORKERS = 4
+
+# The reader's keepalive is never queued. Delivered an hour late it would tell Havenz "this reader
+# spoke just now" about a reader that may since have died - the opposite of what it is for.
+EVENT_UNQUEUED_KINDS = frozenset({"device_is_alive"})
+
+# Havenz will never accept these as they stand (the terminal was removed, the payload is
+# malformed), so retrying every second is pointless - but the cause may be put right (a terminal
+# re-activated), so they are retried slowly for a day before being given up on. Everything else -
+# no network, 5xx, 429, even 401 - is an outage, and is retried until it ends.
+EVENT_REFUSAL_CODES = frozenset({400, 403, 404, 413, 422})
+EVENT_REFUSED_RETRY_SECONDS = 300
+EVENT_REFUSED_GIVE_UP_SECONDS = 24 * 3600
+EVENT_DEAD_LETTER_KEEP = 200
+
+
+class EventQueue:
+    """The on-disk queue of reader events. Thread-safe; one instance per agent."""
+
+    def __init__(self, path, clock=time.time):
+        self.path = path
+        self.dead_path = path + ".dead"
+        self._clock = clock
+        self._lock = threading.Condition()
+        self._pending = []            # records, oldest first
+        self._in_flight = set()       # terminal ids with a delivery in progress
+        self._closed_since_compact = 0
+        self._needs_newline = False
+        self.stats = {"delivered": 0, "dropped": 0, "unpersisted": 0, "corrupt_lines": 0,
+                      "redelivered_after_restart": 0, "last_error": None}
+
+    # -- loading ----------------------------------------------------------
+
+    def load(self):
+        """
+        Pick up where the last process stopped. Never raises.
+
+        A journal that is missing is an empty queue. One that ends in a torn line - the power went
+        mid-append - loses at most that line, which is an event the reader was never answered for
+        and will still hold in its own log. Anything else unreadable is skipped, counted, and
+        logged, because refusing to start would turn one bad line into a site with no events.
+        """
+        puts, closed, corrupt, torn = {}, set(), 0, False
+        try:
+            with open(self.path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            log.info("no event queue at %s yet; starting with an empty one", self.path)
+            return 0
+        except Exception as e:  # noqa: BLE001
+            log.error("could not read the event queue at %s (%s); starting empty - events that "
+                      "were waiting in it are NOT being delivered", self.path, e)
+            return 0
+
+        lines = raw.split(b"\n")
+        self._needs_newline = bool(raw) and not raw.endswith(b"\n")
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8"))
+                if rec.get("v") != EVENT_QUEUE_VERSION:
+                    raise ValueError(f"version {rec.get('v')}")
+                op = rec["op"]
+                if op == "put":
+                    base64.b64decode(rec["body"], validate=True)
+                    puts[rec["id"]] = {
+                        "id": rec["id"], "terminalId": rec["terminalId"], "kind": rec["kind"],
+                        "receivedAt": float(rec["receivedAt"]), "body": rec["body"],
+                        "persisted": True, "attempts": 0, "next_try": 0.0, "refused_since": None,
+                        "mono": None, "size": len(rec["body"]),
+                    }
+                elif op in ("ack", "drop"):
+                    closed.add(rec["id"])
+            except Exception:  # noqa: BLE001
+                if index == len(lines) - 1 and self._needs_newline:
+                    torn = True          # the last line, cut short by a power loss
+                else:
+                    corrupt += 1
+
+        pending = [r for i, r in puts.items() if i not in closed]
+        pending.sort(key=lambda r: r["receivedAt"])
+        with self._lock:
+            self._pending = pending
+            self.stats["corrupt_lines"] += corrupt
+            self.stats["redelivered_after_restart"] = len(pending)
+
+        if torn:
+            log.warning("the event queue ended in a half-written line (power lost mid-write); "
+                        "ignored - that event was never acknowledged to its reader")
+        if corrupt:
+            log.error("%d unreadable line(s) in the event queue at %s were skipped", corrupt, self.path)
+        if pending:
+            oldest = int(self._clock() - pending[0]["receivedAt"])
+            log.warning("recovered %d reader event(s) that had not reached Havenz before the "
+                        "restart (oldest %ds ago); delivering them now", len(pending), oldest)
+        else:
+            log.info("event queue at %s is empty", self.path)
+
+        self._compact()
+        return len(pending)
+
+    # -- writing ----------------------------------------------------------
+
+    def _append(self, record, durable):
+        """Append one journal line. `durable` means fsync before returning."""
+        line = json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+        with open(self.path, "ab") as f:
+            if self._needs_newline:
+                f.write(b"\n")           # never glue a record onto a torn one
+                self._needs_newline = False
+            f.write(line)
+            f.flush()
+            if durable:
+                os.fsync(f.fileno())
+
+    def put(self, terminal_id, kind, body):
+        """
+        Take custody of one event. Returns once it is on disk - the caller answers the reader
+        only after this.
+
+        If the disk write fails the event is kept in memory and delivered anyway, which is exactly
+        what happened to every event before this queue existed; it is logged and counted, because
+        an agent that can no longer write its disk is about to have bigger problems.
+        """
+        now = self._clock()
+        encoded = base64.b64encode(body).decode("ascii")
+        rec = {
+            "id": str(uuid.uuid4()), "terminalId": str(terminal_id), "kind": kind,
+            "receivedAt": now, "body": encoded, "persisted": True, "attempts": 0, "next_try": 0.0,
+            "refused_since": None, "mono": time.monotonic(), "size": len(encoded),
+        }
+        with self._lock:
+            try:
+                self._append({"v": EVENT_QUEUE_VERSION, "op": "put", "id": rec["id"],
+                              "terminalId": rec["terminalId"], "kind": kind,
+                              "receivedAt": now, "body": encoded}, durable=True)
+            except Exception as e:  # noqa: BLE001
+                rec["persisted"] = False
+                self.stats["unpersisted"] += 1
+                log.error("could NOT write a %s event from terminal %s to the event queue (%s); "
+                          "holding it in memory - it will be lost if the agent restarts before "
+                          "Havenz has it", kind, terminal_id, e)
+            self._pending.append(rec)
+            self._enforce_bounds_locked()
+            self._lock.notify_all()
+        return rec
+
+    def _close(self, rec, op, reason=None):
+        with self._lock:
+            if rec in self._pending:
+                self._pending.remove(rec)
+            self._in_flight.discard(rec["terminalId"])
+            if rec["persisted"]:
+                entry = {"v": EVENT_QUEUE_VERSION, "op": op, "id": rec["id"], "at": self._clock()}
+                if reason:
+                    entry["reason"] = reason
+                try:
+                    # Not fsynced. Losing an ack to a power cut costs one re-delivery, which
+                    # Havenz de-duplicates; fsyncing every one would double the SD-card writes.
+                    self._append(entry, durable=(op == "drop"))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("could not journal the %s of event %s (%s); it may be delivered "
+                                "again after a restart", op, rec["id"], e)
+            self._closed_since_compact += 1
+            compact = self._closed_since_compact >= EVENT_COMPACT_AFTER
+            self._lock.notify_all()
+        if compact:
+            self._compact()
+
+    def ack(self, rec):
+        self.stats["delivered"] += 1
+        self._close(rec, "ack")
+
+    def drop(self, rec, reason):
+        """Give up on an event - journalled, logged, counted and dead-lettered; never silent."""
+        self.stats["dropped"] += 1
+        log.warning("DROPPED a %s event from terminal %s received %ds ago: %s (%d dropped since "
+                    "start). The reader's own log still holds it if it was an access event.",
+                    rec["kind"], rec["terminalId"], int(self._clock() - rec["receivedAt"]),
+                    reason, self.stats["dropped"])
+        self._dead_letter(rec, reason)
+        self._close(rec, "drop", reason)
+
+    def _dead_letter(self, rec, reason):
+        try:
+            kept = []
+            try:
+                with open(self.dead_path, "r", encoding="utf-8") as f:
+                    kept = f.read().splitlines()[-(EVENT_DEAD_LETTER_KEEP - 1):]
+            except FileNotFoundError:
+                pass
+            kept.append(json.dumps({
+                "id": rec["id"], "terminalId": rec["terminalId"], "kind": rec["kind"],
+                "receivedAt": rec["receivedAt"], "droppedAt": self._clock(), "reason": reason,
+                "body": rec["body"]}, separators=(",", ":")))
+            tmp = self.dead_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(kept) + "\n")
+            os.replace(tmp, self.dead_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not keep a copy of the dropped event (%s)", e)
+
+    def _enforce_bounds_locked(self):
+        """Oldest out first when the queue outgrows a small box's disk. Caller holds the lock."""
+        def too_big():
+            return (len(self._pending) > EVENT_MAX_PENDING
+                    or sum(r["size"] for r in self._pending) > EVENT_MAX_BYTES)
+
+        while len(self._pending) > 1 and too_big():
+            victim = next((r for r in self._pending if r["terminalId"] not in self._in_flight), None)
+            if victim is None:
+                return
+            self._lock.release()
+            try:
+                self.drop(victim, "the queue is full (uplink down too long) - oldest event discarded")
+            finally:
+                self._lock.acquire()
+
+    def _compact(self):
+        """Rewrite the journal as just what is still waiting. Temp file + replace, never in place."""
+        with self._lock:
+            tmp = self.path + ".tmp"
+            try:
+                with open(tmp, "wb") as f:
+                    for rec in self._pending:
+                        if not rec["persisted"]:
+                            continue
+                        f.write(json.dumps({
+                            "v": EVENT_QUEUE_VERSION, "op": "put", "id": rec["id"],
+                            "terminalId": rec["terminalId"], "kind": rec["kind"],
+                            "receivedAt": rec["receivedAt"], "body": rec["body"]},
+                            separators=(",", ":")).encode("utf-8") + b"\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+                self._closed_since_compact = 0
+                self._needs_newline = False
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not compact the event queue at %s (%s); carrying on with the "
+                            "journal as it is", self.path, e)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    # -- reading ----------------------------------------------------------
+
+    def age_ms(self, rec):
+        """
+        How long this event has been in our custody.
+
+        Sent with every delivery so Havenz can tell an arrival from history: an event that waited
+        out an afternoon's outage must be recorded, and must NOT flash "Welcome" on a door panel
+        for someone who walked through hours ago. Measured on the monotonic clock while the
+        process that received it is still running, so a Pi whose wall clock jumps when NTP
+        arrives does not invent or hide an hour; across a restart only the wall clock survives.
+        """
+        if rec.get("mono") is not None:
+            return max(0, int((time.monotonic() - rec["mono"]) * 1000))
+        return max(0, int((self._clock() - rec["receivedAt"]) * 1000))
+
+    def take(self, timeout=None):
+        """
+        The next event ready to be delivered, or None after `timeout`.
+
+        In order per terminal: a door's events go up in the order its reader sent them, so a
+        terminal with a delivery in flight, or whose oldest event is waiting out a retry, is
+        skipped whole. Other doors carry on - one removed terminal must not dam the site.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lock:
+            while True:
+                now = self._clock()
+                blocked = set(self._in_flight)
+                expired, wake_in = [], None
+                for rec in self._pending:
+                    tid = rec["terminalId"]
+                    if tid in blocked:
+                        continue
+                    if now - rec["receivedAt"] > EVENT_MAX_AGE_SECONDS:
+                        expired.append(rec)
+                        continue
+                    if rec["next_try"] > now:
+                        blocked.add(tid)
+                        wait = rec["next_try"] - now
+                        wake_in = wait if wake_in is None else min(wake_in, wait)
+                        continue
+                    if not expired:
+                        self._in_flight.add(tid)
+                        return rec
+                    break
+
+                if expired:
+                    self._lock.release()
+                    try:
+                        for rec in expired:
+                            self.drop(rec, "undelivered for a week")
+                    finally:
+                        self._lock.acquire()
+                    continue
+
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                waits = [w for w in (wake_in, remaining) if w is not None]
+                self._lock.wait(min(waits) if waits else None)
+
+    def retry_later(self, rec, delay, error, refused=False):
+        """Put an event back, to be tried again after `delay` seconds."""
+        with self._lock:
+            rec["attempts"] += 1
+            rec["next_try"] = self._clock() + delay
+            if refused and rec["refused_since"] is None:
+                rec["refused_since"] = self._clock()
+            self.stats["last_error"] = error
+            self._in_flight.discard(rec["terminalId"])
+            self._lock.notify_all()
+
+    def delivered_attempt(self, rec):
+        with self._lock:
+            rec["attempts"] += 1
+
+    def snapshot(self):
+        with self._lock:
+            oldest = self._pending[0]["receivedAt"] if self._pending else None
+            return {
+                "pending": len(self._pending),
+                "oldest_age_seconds": None if oldest is None else int(self._clock() - oldest),
+                **self.stats,
+            }
+
+
+def event_headers(cfg, rec, age_ms, attempt):
     """
-    Receive access events straight from the readers and pass them upstream.
+    X-Terminal-Id names the reader; our hub key proves we are entitled to speak for it. The
+    backend checks the terminal belongs to this agent's property, so a compromised agent in one
+    building cannot invent access events against doors in another.
+    """
+    return {
+        "Content-Type": "application/json",
+        "X-Hub-Key": cfg.get("hub_key", ""),
+        "X-Agent-Version": AGENT_VERSION,
+        "X-Terminal-Id": str(rec["terminalId"]),
+        "X-Event-Id": rec["id"],
+        "X-Event-Age-Ms": str(age_ms),
+        "X-Event-Attempt": str(attempt),
+    }
+
+
+def post_event(cfg, rec, age_ms, attempt):
+    """
+    One attempt to hand an event to Havenz. Returns ("ok" | "retry" | "refused", detail).
+
+    The payload goes up byte for byte as the reader sent it - parsing, idempotency and
+    broadcasting all stay in the one implementation on the backend that already gets them right.
+    """
+    url = f"{cfg['api_url'].rstrip('/')}/api/amico/notifications/{rec['kind']}"
+    body = base64.b64decode(rec["body"])
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers=event_headers(cfg, rec, age_ms, attempt))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        return "ok", None
+    except urllib.error.HTTPError as e:
+        detail = f"HTTP {e.code}"
+        return ("refused" if e.code in EVENT_REFUSAL_CODES else "retry"), detail
+    except Exception as e:  # noqa: BLE001
+        return "retry", str(e)
+
+
+def deliver_one(cfg, queue, rec, post=None):
+    """Deliver one taken event and settle it in the queue. Returns the outcome."""
+    post = post or post_event
+    attempt = rec["attempts"] + 1
+    outcome, detail = post(cfg, rec, queue.age_ms(rec), attempt)
+
+    if outcome == "ok":
+        queue.delivered_attempt(rec)
+        queue.ack(rec)
+        if attempt > 1 or queue.age_ms(rec) > 5000:
+            log.info("relayed %s event from terminal %s on attempt %d, %ds after the reader sent it",
+                     rec["kind"], rec["terminalId"], attempt, queue.age_ms(rec) // 1000)
+        else:
+            log.info("relayed %s event from terminal %s", rec["kind"], rec["terminalId"])
+        return outcome
+
+    if outcome == "refused":
+        since = rec["refused_since"]
+        if since is not None and queue._clock() - since > EVENT_REFUSED_GIVE_UP_SECONDS:
+            queue.drop(rec, f"refused by Havenz for a day ({detail})")
+            return "dropped"
+        if since is None:
+            log.warning("Havenz refused a %s event from terminal %s (%s) - is that door still "
+                        "assigned to this agent? Keeping it; trying again every %d minutes for a day",
+                        rec["kind"], rec["terminalId"], detail, EVENT_REFUSED_RETRY_SECONDS // 60)
+        queue.retry_later(rec, EVENT_REFUSED_RETRY_SECONDS, detail, refused=True)
+        return outcome
+
+    # An outage, not a refusal: keep it, back off, keep trying until the uplink is back.
+    delay = min(BACKOFF_MAX_SECONDS, 2 ** min(rec["attempts"], 6))
+    if rec["attempts"] in (0, 3) or rec["attempts"] % 20 == 0:
+        log.warning("could not relay %s from terminal %s (%s) - it is safe on disk; trying again "
+                    "in %ds", rec["kind"], rec["terminalId"], detail, delay)
+    queue.retry_later(rec, delay, detail)
+    return outcome
+
+
+def event_delivery_loop(cfg, queue):
+    """One delivery worker. Several run; the queue keeps each door's events in order."""
+    while True:
+        try:
+            rec = queue.take(timeout=30)
+            if rec is not None:
+                deliver_one(cfg, queue, rec)
+        except Exception:  # noqa: BLE001 - this loop must outlive everything
+            log.exception("event delivery worker hit an unexpected error; carrying on")
+            time.sleep(1)
+
+
+def relay_unqueued(cfg, terminal_id, kind, raw):
+    """
+    Best-effort relay for what is deliberately not queued: keepalives, and the rare event too big
+    to journal. One try, now. A keepalive that cannot be delivered now is worthless later.
+    """
+    rec = {"id": str(uuid.uuid4()), "terminalId": str(terminal_id), "kind": kind,
+           "body": base64.b64encode(raw).decode("ascii")}
+    outcome, detail = post_event(cfg, rec, 0, 1)
+    if outcome != "ok" and kind not in EVENT_UNQUEUED_KINDS:
+        log.warning("could not relay an oversized %s event from terminal %s (%s); it was not "
+                    "queued", kind, terminal_id, detail)
+
+
+def start_event_listener(cfg, port, queue=None):
+    """
+    Receive access events straight from the readers, keep them safe, and pass them upstream.
 
     Once this is running there is no internet-facing webhook for an agent-served site at all.
     That dissolves a real problem rather than mitigating it: the public endpoint identified a
@@ -1290,9 +1920,18 @@ def start_event_listener(cfg, port):
     the device. Here the reader is on our own network and we authenticate the relay ourselves.
 
     The reader posts to hostname:port/{path}/{kind}, so this serves /api/amico/notifications/dao
-    and its siblings. The payload is passed through untouched — parsing, idempotency and
-    broadcasting all stay in the one implementation on the backend that already gets them right.
+    and its siblings.
+
+    The order is the point: the event is written to the on-disk queue FIRST, the reader is
+    answered SECOND, and delivery to Havenz happens from the queue. Answering first and hoping
+    to deliver - what this used to do - means a restart or a ten-second uplink blip loses an event
+    the reader believes we have.
     """
+    if queue is None:
+        queue = EventQueue(cfg.get("event_queue_path") or "/data/events.jsonl")
+        queue.load()
+    STATE["event_queue"] = queue
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -1311,20 +1950,27 @@ def start_event_listener(cfg, port):
 
             # Which reader this is. On our own LAN the source address is trustworthy in a way it
             # never is across the internet — we are on the same broadcast domain as the device.
-            terminal_id = None
-            for tid, reader in (STATE.get("readers") or {}).items():
-                if reader.host == source:
-                    terminal_id = tid
-                    break
+            terminal_id = terminal_for_source(source)
 
             if terminal_id is None:
                 log.warning("event from %s on this LAN, which is not a reader we manage — ignored", source)
                 return self._reply(404)
 
-            # Answer the reader immediately, then forward. A reader kept waiting on our uplink is
-            # a reader that may give up and drop the event, and it has already done its job.
+            if kind in EVENT_UNQUEUED_KINDS or len(raw) > EVENT_MAX_BODY_BYTES:
+                self._reply(200)
+                threading.Thread(target=relay_unqueued, args=(cfg, terminal_id, kind, raw),
+                                 daemon=True).start()
+                return
+
+            # Disk first, reader second. put() returns once the event is fsynced (or, if the disk
+            # refused, once it is at least held in memory - no worse than before there was a queue).
+            try:
+                queue.put(terminal_id, kind, raw)
+            except Exception:  # noqa: BLE001 - a reader must never see our bug as its problem
+                log.exception("the event queue refused a %s event; relaying it directly", kind)
+                threading.Thread(target=relay_unqueued, args=(cfg, terminal_id, kind, raw),
+                                 daemon=True).start()
             self._reply(200)
-            threading.Thread(target=forward_event, args=(cfg, terminal_id, kind, raw), daemon=True).start()
 
         def do_GET(self):
             self._reply(200, b'{"havenz":"site agent event listener"}')
@@ -1334,42 +1980,10 @@ def start_event_listener(cfg, port):
     # nineteen, and a reader kept waiting may give up on an event it has already recorded.
     server = ThreadedHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("listening for reader events on port %d", port)
+    for _ in range(EVENT_DELIVERY_WORKERS):
+        threading.Thread(target=event_delivery_loop, args=(cfg, queue), daemon=True).start()
+    log.info("listening for reader events on port %d (queue: %s)", port, queue.path)
     return server
-
-
-def forward_event(cfg, terminal_id, kind, raw):
-    """
-    Relay one reader event upstream, retrying briefly before giving up.
-
-    X-Terminal-Id names the reader; our hub key proves we are entitled to speak for it. The
-    backend checks the terminal belongs to this agent's property, so a compromised agent in one
-    building cannot invent access events against doors in another.
-    """
-    url = f"{cfg['api_url'].rstrip('/')}/api/amico/notifications/{kind}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Hub-Key": cfg.get("hub_key", ""),
-        "X-Agent-Version": AGENT_VERSION,
-        "X-Terminal-Id": str(terminal_id),
-    }
-
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, data=raw, method="POST", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp.read()
-            log.info("relayed %s event from terminal %s", kind, terminal_id)
-            return
-        except Exception as e:  # noqa: BLE001
-            if attempt == 2:
-                # Not fatal, and deliberately not buffered here: the reader keeps its own access
-                # log and the backend's poller collects anything the webhook missed. The webhook
-                # makes events instant; the poller is what makes them survive.
-                log.warning("could not relay %s from terminal %s (%s) — the poller will "
-                            "collect it later", kind, terminal_id, e)
-                return
-            time.sleep(2 ** attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -1458,9 +2072,12 @@ the Havenz app). This agent will stop serving the current property immediately.<
       if (s.last_error) { conn.className='bad'; conn.textContent='\\u26a0 ' + s.last_error; }
       else if (s.seconds_since_heartbeat === null) { conn.className='ok'; conn.textContent='Connecting\\u2026'; }
       else { conn.className='ok'; conn.textContent='\\u2713 Connected to Havenz'; }
-      detail.textContent = s.seconds_since_heartbeat === null ? ''
+      const ev = s.events || {};
+      detail.textContent = (s.seconds_since_heartbeat === null ? ''
         : 'Last contact ' + s.seconds_since_heartbeat + 's ago' +
-          (s.site_name ? ' \\u2014 ' + s.site_name : '');
+          (s.site_name ? ' \\u2014 ' + s.site_name : '')) +
+        (ev.pending ? ' \\u2014 ' + ev.pending + ' door event(s) waiting to be sent' : '') +
+        (ev.dropped ? ' \\u2014 ' + ev.dropped + ' dropped' : '');
       document.getElementById('terms').innerHTML = (s.terminals||[]).length
         ? s.terminals.map(t => '<li><span>' + t.name + '</span><span>' + (t.ipAddress||'') + '</span></li>').join('')
         : '<li><span>No doors assigned to this agent yet</span><span></span></li>';
@@ -1506,6 +2123,8 @@ def start_web_server(cfg_path, cfg, port, paired_event):
                     "last_error": STATE["last_error"],
                     "clock_skew_seconds": STATE["clock_skew_seconds"],
                     "terminals": STATE["terminals"],
+                    # Reader events still waiting to reach Havenz, and anything given up on.
+                    "events": STATE["event_queue"].snapshot() if STATE.get("event_queue") else None,
                 }))
             html = STATUS_HTML if cfg.get("hub_key") else SETUP_HTML
             self._send(200, html, "text/html; charset=utf-8")
@@ -1574,7 +2193,12 @@ def main():
         print(json.dumps(STATE["terminals"], indent=2))
         return
 
+    # Which address is which door, as of the last time Havenz told us - so an event that arrives
+    # while Havenz is unreachable is attributed and queued rather than refused.
+    roster_load(cfg)
+
     # Readers post their events to us directly, so this has to be up before we tell any of them to.
+    # It also recovers whatever was still waiting in the on-disk queue when the agent last stopped.
     start_event_listener(cfg, int(cfg.get("webhook_port", 8100)))
 
     # Learn the roster once at startup so an event arriving in the first few seconds can be

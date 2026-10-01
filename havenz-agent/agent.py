@@ -49,6 +49,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from queue import Empty, Queue
 from socketserver import ThreadingMixIn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -91,7 +92,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.5.0"
+AGENT_VERSION = "0.6.0"
 
 # How far our clock may differ from the backend's before we say so.
 #
@@ -169,8 +170,12 @@ def load_config(path):
     cfg.setdefault("discovery_enabled", False)
     cfg.setdefault("discovery_interval_seconds", 900)
     # Which doors this agent has already opened, kept where a restart cannot lose it. /data is the
-    # add-on's own persistent volume — the same place the hub key lives.
-    cfg.setdefault("executed_store_path", "/data/executed.json")
+    # add-on's own persistent volume — the same place the hub key lives. (A box paired under 0.5.0
+    # has "/data/executed.json" saved here; executed_store_path() reads that as the journal beside it.)
+    cfg.setdefault("executed_store_path", "/data/executed.jsonl")
+    # Command results wait here until Havenz has them, so a refused or undeliverable result is
+    # sent again instead of being thrown away.
+    cfg.setdefault("result_outbox_path", "/data/results.jsonl")
     # Reader events wait here, on disk, until Havenz has them. Written before the reader is
     # answered, so neither a restart nor an uplink outage can lose one.
     cfg.setdefault("event_queue_path", "/data/events.jsonl")
@@ -811,6 +816,13 @@ def heartbeat_loop(cfg):
                 log.error("this agent is no longer authorised (HTTP %d). Re-pair it from the "
                           "Havenz app: %s", e.code, detail)
                 time.sleep(BACKOFF_MAX_SECONDS)
+            elif e.code == 429:
+                # Told how long to stay away. A heartbeat that waits exactly that long is back
+                # sooner than one that guesses, and Havenz calls an agent offline after ninety
+                # seconds of silence.
+                delay = retry_after_seconds(e, backoff)
+                log.warning("heartbeat failed (HTTP %d): %s — retrying in %ds", e.code, detail, delay)
+                time.sleep(delay)
             else:
                 log.warning("heartbeat failed (HTTP %d): %s — retrying in %ds", e.code, detail, backoff)
                 time.sleep(backoff)
@@ -981,50 +993,144 @@ def discovery_loop(cfg):
 # retried, and the door opened again. A Pi restarts: on an update, on a power blip, on a crash. The
 # add-on already owns /data, so persisting is cheap and the gap is not.
 #
+# On disk it is an append-only journal, one line per piece of work:
+#
+#   {"v":2,"keys":["<command id>","<intent id>"],"at":<epoch>,"result":<what the reader said>}
+#
+# Until 0.6.0 it was one JSON file, written out in full, fsynced and swapped in after every
+# command. With a day's enrolment in it that was 0.2-0.4 s per command (measured at the first plant
+# rehearsal, ~3,000 entries), paid on the one path every door's work passes through: a remote
+# unlock opened the door in a tenth of a second and the app waited half a second more for this
+# file. Appending a line costs the same whether the store holds ten entries or five thousand, and
+# a power cut can tear at most the last line, which is ignored on the way back in.
+#
 # Bounded, because this runs for months on a small box: the newest EXECUTED_MAX entries, and
 # nothing older than EXECUTED_TTL_SECONDS. A week is far longer than any command's own lifetime
-# (the longest is two minutes), so the bound can never discard something still in play.
+# (the longest is two minutes), so the bound can never discard something still in play. The journal
+# is rewritten as just what is still remembered when the agent starts and whenever it has grown to
+# twice that - on a background thread, never on a command's path.
 _executed = {}
 _executed_lock = threading.Lock()
 
 EXECUTED_MAX = 5000
 EXECUTED_TTL_SECONDS = 7 * 24 * 3600
-EXECUTED_STORE_VERSION = 1
+EXECUTED_STORE_VERSION = 2           # the journal. 1 was the whole-file store of 0.5.0.
+EXECUTED_LEGACY_VERSION = 1
+EXECUTED_COMPACT_MIN_LINES = 1000
+
+# Work whose record must be ON THE DISK before anyone is told it was done.
+#
+# The record exists so that a door is not opened twice, so for a door nothing changes from 0.5.0:
+# by the time the result is reported, the line saying "this tap has been carried out" has been
+# fsynced. (An enrolment is in the list because repeating it means asking a person to stand at the
+# reader again.) Everything else that changes a reader - a user push, a photo, a removal - is safe
+# to repeat, so its line is appended and handed to the operating system, and the background thread
+# fsyncs it within a second. A process that dies keeps those lines; only a power cut inside that
+# second can lose one, and what it loses is the memory of work that is harmless to do again.
+EXECUTED_DURABLE_FIRST = frozenset({"OpenDoor", "StartRemoteEnrollment"})
+
+# How often the background thread syncs what was appended without an fsync (this journal's lines
+# and the result outbox's), and looks at whether either has grown enough to be rewritten.
+STORAGE_SYNC_SECONDS = 1.0
+
+# The file itself: which path the counters below describe, how many lines it holds, whether
+# anything has been appended since the last fsync, and whether it ends in a torn line that the next
+# append must not be glued onto. `tail` collects lines appended while a compaction is writing its
+# copy, so they can be carried over before the copy is swapped in.
+_executed_file_lock = threading.Lock()
+_executed_file = {"path": None, "lines": 0, "dirty": False, "needs_newline": False, "tail": None}
 
 
 def executed_store_path(cfg):
-    """Where the executed set lives. /data survives restarts and add-on updates; /tmp does not."""
-    return cfg.get("executed_store_path") or "/data/executed.json"
-
-
-def executed_store_load(cfg):
     """
-    Re-read what this agent did before it restarted.
+    Where the executed journal lives. /data survives restarts and add-on updates; /tmp does not.
 
-    Never raises. A store that is missing, truncated by a power cut, or written by a newer version
-    leaves the agent exactly where it was before this existed — deduplicating in memory only — and
-    that is strictly better than refusing to start. It is logged loudly, because silently forgetting
-    which doors you opened is the failure this whole file is about.
+    A box paired under 0.5.0 has "/data/executed.json" saved in its config.json. That name now
+    means "the journal beside it": the .json file is the old whole-file store, read once on the
+    first start and removed (see executed_store_load).
     """
-    path = executed_store_path(cfg)
+    path = cfg.get("executed_store_path") or "/data/executed.jsonl"
+    return path + "l" if path.endswith(".json") else path
+
+
+def _executed_legacy_path(path):
+    """The 0.5.0 store that belongs to this journal, if the name says there could be one."""
+    return path[:-1] if path.endswith(".jsonl") else None
+
+
+def _executed_file_state(path):
+    """The counters for `path`, started afresh if they were describing another file. Caller holds the file lock."""
+    state = _executed_file
+    if state["path"] != path:
+        lines, torn = 0, False
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            lines = raw.count(b"\n")
+            torn = bool(raw) and not raw.endswith(b"\n")
+        except OSError:
+            pass
+        state.update(path=path, lines=lines, dirty=False, needs_newline=torn, tail=None)
+    return state
+
+
+def _executed_read_journal(path):
+    """Every readable line of the journal as {key: entry}. Returns (entries, lines, corrupt, torn). Never raises."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, 0, 0, False
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not read the executed-command journal at %s (%s); starting empty - a "
+                    "command in flight across this restart may run twice", path, e)
+        return {}, 0, 0, False
+
+    loaded, corrupt, torn = {}, 0, False
+    lines = raw.split(b"\n")
+    ends_whole = raw.endswith(b"\n")
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line.decode("utf-8"))
+            if rec.get("v") != EXECUTED_STORE_VERSION:
+                raise ValueError(f"version {rec.get('v')}")
+            entry = {"at": float(rec.get("at") or 0), "result": rec.get("result")}
+            for key in rec["keys"]:
+                if key:
+                    loaded[key] = entry
+        except Exception:  # noqa: BLE001
+            if index == len(lines) - 1 and not ends_whole:
+                torn = True              # the last line, cut short by a power loss
+            else:
+                corrupt += 1
+    return loaded, sum(1 for line in lines if line.strip()), corrupt, torn
+
+
+def _executed_read_legacy(path):
+    """
+    The entries of a 0.5.0 store, or None when there is nothing usable there.
+
+    Unreadable, or written by a version this agent does not know: left where it is and ignored,
+    loudly - exactly what 0.5.0 did with a store it could not read.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             stored = json.load(f)
     except FileNotFoundError:
-        log.info("no executed-command store at %s yet; starting with an empty one", path)
-        return 0
+        return None
     except Exception as e:  # noqa: BLE001
-        log.warning("could not read the executed-command store at %s (%s); "
-                    "starting empty — a command in flight across this restart may run twice", path, e)
-        return 0
+        log.warning("could not read the 0.5.0 executed-command store at %s (%s); ignoring it - a "
+                    "command in flight across this update may run twice", path, e)
+        return None
 
-    if not isinstance(stored, dict) or stored.get("version") != EXECUTED_STORE_VERSION:
+    if not isinstance(stored, dict) or stored.get("version") != EXECUTED_LEGACY_VERSION:
         log.warning("executed-command store at %s is version %s, not %s; ignoring it",
-                    path, (stored or {}).get("version") if isinstance(stored, dict) else "?",
-                    EXECUTED_STORE_VERSION)
-        return 0
+                    path, stored.get("version") if isinstance(stored, dict) else "?",
+                    EXECUTED_LEGACY_VERSION)
+        return None
 
-    cutoff = time.time() - EXECUTED_TTL_SECONDS
     loaded = {}
     for entry in stored.get("entries") or []:
         try:
@@ -1032,16 +1138,67 @@ def executed_store_load(cfg):
             at = float(entry.get("at") or 0)
         except Exception:  # noqa: BLE001
             continue
-        if not key or at < cutoff:
-            continue
-        loaded[key] = {"at": at, "result": entry.get("result")}
+        if key:
+            loaded[key] = {"at": at, "result": entry.get("result")}
+    return loaded
+
+
+def executed_store_load(cfg):
+    """
+    Re-read what this agent did before it restarted. Returns how many keys it remembers.
+
+    Never raises. A journal that is missing, torn by a power cut, or holding lines this version
+    cannot read leaves the agent with whatever could be read - at worst deduplicating in memory
+    only, exactly where it was before this existed - and that is strictly better than refusing to
+    start. It is logged loudly, because silently forgetting which doors you opened is the failure
+    this whole file is about.
+
+    The first start after an update from 0.5.0 finds that version's whole-file store, takes its
+    entries into the journal and removes it.
+    """
+    path = executed_store_path(cfg)
+    loaded, lines, corrupt, torn = _executed_read_journal(path)
+
+    legacy_path = _executed_legacy_path(path)
+    legacy = _executed_read_legacy(legacy_path) if legacy_path else None
+    if legacy:
+        for key, entry in legacy.items():
+            loaded.setdefault(key, entry)        # the journal, being newer, wins
+
+    cutoff = time.time() - EXECUTED_TTL_SECONDS
+    loaded = {key: entry for key, entry in loaded.items() if entry["at"] >= cutoff}
 
     with _executed_lock:
         _executed.clear()
         _executed.update(loaded)
+        _executed_prune_locked()
+        remembered = len(_executed)
 
-    log.info("recovered %d executed command(s) from %s", len(loaded), path)
-    return len(loaded)
+    with _executed_file_lock:
+        _executed_file.update(path=path, lines=lines, dirty=False, needs_newline=torn, tail=None)
+
+    if torn:
+        log.warning("the executed-command journal ended in a half-written line (power lost "
+                    "mid-write); ignored")
+    if corrupt:
+        log.warning("%d unreadable line(s) in the executed-command journal at %s were skipped",
+                    corrupt, path)
+
+    if lines or legacy is not None:
+        # Start from a file that holds exactly what is remembered: no torn line, nothing expired.
+        written = _executed_compact(path)
+        if legacy is not None and written:
+            try:
+                os.unlink(legacy_path)
+                log.info("took %d entr%s over from the 0.5.0 store at %s and removed it",
+                         len(legacy), "y" if len(legacy) == 1 else "ies", legacy_path)
+            except OSError as e:
+                log.warning("could not remove the 0.5.0 store at %s (%s); it will be read again "
+                            "at the next start, which is harmless", legacy_path, e)
+        log.info("recovered %d executed command(s) from %s", remembered, path)
+    else:
+        log.info("no executed-command journal at %s yet; starting with an empty one", path)
+    return remembered
 
 
 def _executed_prune_locked():
@@ -1056,47 +1213,201 @@ def _executed_prune_locked():
             _executed.pop(key, None)
 
 
-def _executed_save_locked(cfg):
+def _executed_append(cfg, keys, at, result, durable):
     """
-    Write the set out atomically. Caller holds the lock.
+    Add one line to the journal.
 
-    Temp file plus replace, because the alternative — truncating the real file and writing into it
-    — has a window where a power cut leaves an empty store, which is worse than no store at all: it
-    reads as "this agent has never opened a door".
+    `durable` means the line is fsynced before this returns. Otherwise it is written and flushed to
+    the operating system, and the background thread fsyncs it within a second.
 
     A failure to write is logged, never raised. The work is already done; losing the record of it
     costs a possible repeat after a restart, while refusing to acknowledge a door we just opened
     costs a retry immediately.
     """
     path = executed_store_path(cfg)
-    payload = {
-        "version": EXECUTED_STORE_VERSION,
-        "entries": [{"key": k, "at": v["at"], "result": v["result"]} for k, v in _executed.items()],
-    }
+    try:
+        line = json.dumps({"v": EXECUTED_STORE_VERSION, "keys": keys, "at": at, "result": result},
+                          separators=(",", ":")).encode("utf-8") + b"\n"
+        with _executed_file_lock:
+            state = _executed_file_state(path)
+            f = open(path, "ab")
+            try:
+                if state["needs_newline"]:
+                    f.write(b"\n")           # never glue a record onto a torn one
+                    state["needs_newline"] = False
+                f.write(line)
+                f.flush()
+            except Exception:
+                f.close()
+                raise
+            state["lines"] += 1
+            if state["tail"] is not None:
+                state["tail"].append(line)
+            if not durable:
+                state["dirty"] = True
+                f.close()
+        # The fsync is outside the lock: it is the slow part, and another door's line must not
+        # wait for it. It covers everything written to the file so far, this line included.
+        if durable:
+            try:
+                os.fsync(f.fileno())
+            finally:
+                f.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not persist the executed-command journal to %s (%s)", path, e)
+        return
+    if not durable:
+        _flusher_start()
+
+
+def _executed_compact(path):
+    """
+    Rewrite the journal as just what is still remembered. Returns True if it was replaced.
+
+    Temp file plus replace, never truncated in place: truncating the real file leaves a window
+    where a power cut produces an empty store, which reads as "this agent has never opened a door".
+
+    The copy is written without holding the file lock, so a command that finishes meanwhile is not
+    kept waiting; whatever was appended in that time is carried over under the lock just before the
+    copy is swapped in.
+    """
     tmp = path + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, separators=(",", ":"))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        with _executed_file_lock:
+            state = _executed_file_state(path)
+            if state["tail"] is not None:
+                return False                 # another compaction is already writing its copy
+            with _executed_lock:
+                groups = {}
+                for key, entry in _executed.items():
+                    groups.setdefault(id(entry), (entry, []))[1].append(key)
+                snapshot = sorted(((entry["at"], keys, entry["result"]) for entry, keys in groups.values()),
+                                  key=lambda item: item[0])
+            state["tail"] = []
+
+        try:
+            with open(tmp, "wb") as f:
+                for at, keys, result in snapshot:
+                    f.write(json.dumps({"v": EXECUTED_STORE_VERSION, "keys": keys, "at": at,
+                                        "result": result}, separators=(",", ":")).encode("utf-8") + b"\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+            with _executed_file_lock:
+                state = _executed_file
+                if state["path"] != path:
+                    raise RuntimeError("the journal moved while it was being compacted")
+                tail = state["tail"] or []
+                if tail:
+                    with open(tmp, "ab") as f:
+                        f.writelines(tail)
+                        f.flush()
+                        os.fsync(f.fileno())
+                os.replace(tmp, path)
+                state.update(lines=len(snapshot) + len(tail), dirty=False, needs_newline=False, tail=None)
+            return True
+        except Exception:
+            with _executed_file_lock:
+                if _executed_file["path"] == path:
+                    _executed_file["tail"] = None
+            raise
     except Exception as e:  # noqa: BLE001
-        log.warning("could not persist the executed-command store to %s (%s)", path, e)
+        log.warning("could not compact the executed-command journal at %s (%s); carrying on with "
+                    "the journal as it is", path, e)
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        return False
 
 
-def _remember(cfg, command_id, intent_id, result):
-    """Record that this command — and the intent behind it — has been carried out."""
+def executed_store_sync(cfg=None):
+    """
+    What the background thread does for this journal every second: fsync whatever was appended
+    without one, and rewrite the journal if it has grown to twice what is still remembered.
+
+    One caller at a time (the sync lock), and never under the file lock while the disk is being
+    waited on - a command appending its line must not queue behind this.
+    """
+    with _executed_sync_lock:
+        with _executed_file_lock:
+            path = executed_store_path(cfg) if cfg else _executed_file["path"]
+            if not path:
+                return
+            state = _executed_file_state(path)
+            dirty, lines = state["dirty"], state["lines"]
+            state["dirty"] = False
+
+        if dirty:
+            try:
+                with open(path, "ab") as f:
+                    os.fsync(f.fileno())
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not sync the executed-command journal at %s (%s)", path, e)
+
+        if lines > EXECUTED_COMPACT_MIN_LINES:
+            with _executed_lock:
+                live = len({id(entry) for entry in _executed.values()})
+            if lines > max(EXECUTED_COMPACT_MIN_LINES, 2 * live):
+                _executed_compact(path)
+
+
+_executed_sync_lock = threading.Lock()
+
+
+_flusher = {"thread": None}
+_flusher_lock = threading.Lock()
+
+
+def _flusher_start():
+    """Start the background sync thread if it is not running. Safe to call from anywhere, often."""
+    with _flusher_lock:
+        thread = _flusher["thread"]
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=storage_sync_loop, daemon=True, name="storage-sync")
+            _flusher["thread"] = thread
+            thread.start()
+
+
+def storage_sync_loop():
+    """
+    The one thread that pays for the disk so that no door has to.
+
+    Every second: fsync the executed journal and the result outbox if anything was appended to them
+    without an fsync, and compact either one that has outgrown what it holds.
+    """
+    while True:
+        time.sleep(STORAGE_SYNC_SECONDS)
+        try:
+            executed_store_sync()
+        except Exception:  # noqa: BLE001 - this loop must outlive everything
+            log.exception("syncing the executed-command journal hit an unexpected error; carrying on")
+        outbox = STATE.get("result_outbox")
+        if outbox is not None:
+            try:
+                outbox.sync()
+            except Exception:  # noqa: BLE001
+                log.exception("syncing the result outbox hit an unexpected error; carrying on")
+
+
+def _remember(cfg, command_id, intent_id, result, kind=None):
+    """
+    Record that this command — and the intent behind it — has been carried out.
+
+    One line appended to the journal. For a door (see EXECUTED_DURABLE_FIRST) the line is on the
+    disk before this returns; for anything else it is with the operating system and synced within
+    a second.
+    """
     now = time.time()
+    keys = [key for key in (command_id, intent_id) if key]
+    if not keys:
+        return
+    entry = {"at": now, "result": result}
     with _executed_lock:
-        for key in (command_id, intent_id):
-            if key:
-                _executed[key] = {"at": now, "result": result}
+        for key in keys:
+            _executed[key] = entry
         _executed_prune_locked()
-        _executed_save_locked(cfg)
+    _executed_append(cfg, keys, now, result, durable=kind in EXECUTED_DURABLE_FIRST)
 
 
 def _already_executed(command_id, intent_id):
@@ -1120,10 +1431,18 @@ def _already_executed(command_id, intent_id):
 # They used to be, results and all - and the access log is read every thirty seconds per door, so
 # the executed store filled with thousands of copies of reader logs and was rewritten in full after
 # every command. On a Pi's SD card that is wear and latency spent protecting nothing: the set exists
-# so that a DOOR is not opened twice.
+# so that a DOOR is not opened twice. Their results are not journalled in the result outbox either
+# (see report): a read that could not be reported is simply read again.
 READ_ONLY_COMMANDS = frozenset({
     "GetSystemInfo", "GetAccessLogs", "FindTerminalUserId", "GetUserRegistrationMap",
 })
+
+
+# Guards the roster refresh. With one worker per reader, twenty of them can meet a terminal they do
+# not know in the same moment (a reader just claimed, or the first batch after a start); one fetch
+# answers all of them.
+_readers_lock = threading.Lock()
+_readers_fetched = {"at": 0.0}
 
 
 def readers_for(cfg, force=False):
@@ -1133,15 +1452,27 @@ def readers_for(cfg, force=False):
     Refetched when the backend mentions a terminal we do not know about, so a reader claimed in
     Zhub becomes usable without restarting the add-on.
     """
-    if force or not STATE.get("readers"):
+    held = STATE.get("readers")
+    if held and not force:
+        return held
+
+    asked = time.monotonic()
+    with _readers_lock:
+        held = STATE.get("readers")
+        # Somebody else fetched it while we were waiting for the lock: that answer is newer than
+        # our question, so it is the one we wanted.
+        if held and (not force or _readers_fetched["at"] >= asked):
+            return held
         rows = backend_get(cfg, "/api/agent/terminals")
-        STATE["readers"] = {
+        held = {
             r["id"]: Reader(r["id"], r.get("name", "?"), r["ipAddress"], r["username"], r["password"])
             for r in rows
         }
-        log.info("hold credentials for %d reader(s)", len(STATE["readers"]))
-        roster_save(cfg, {r.host: tid for tid, r in STATE["readers"].items()})
-    return STATE["readers"]
+        STATE["readers"] = held
+        _readers_fetched["at"] = time.monotonic()
+        log.info("hold credentials for %d reader(s)", len(held))
+        roster_save(cfg, {r.host: tid for tid, r in held.items()})
+        return held
 
 
 def execute(cfg, command):
@@ -1198,6 +1529,15 @@ def expired(command):
 
 def handle(cfg, command):
     """Execute one command and report the outcome. Never raises."""
+    # Noted for report(): the result of a read is kept in memory, the result of work on disk.
+    _in_hand.kind = command.get("type")
+    try:
+        _handle(cfg, command)
+    finally:
+        _in_hand.kind = None
+
+
+def _handle(cfg, command):
     command_id = command.get("id")
     intent_id = command.get("intentId")
 
@@ -1241,7 +1581,7 @@ def handle(cfg, command):
         result = execute(cfg, command)
         elapsed = int((time.time() - started) * 1000)
         if command.get("type") not in READ_ONLY_COMMANDS:
-            _remember(cfg, command_id, intent_id, result)
+            _remember(cfg, command_id, intent_id, result, command.get("type"))
         breaker_record(terminal_id, True, command.get("type"))
         log.info("%s on terminal %s in %dms", command.get("type"), terminal_id, elapsed)
         report(cfg, command_id, True, result, None, elapsed)
@@ -1272,36 +1612,511 @@ def handle(cfg, command):
         report(cfg, command_id, False, None, f"agent error: {e}", elapsed)
 
 
-def run_in_parallel(cfg, commands, max_parallel):
+# ---------------------------------------------------------------------------
+# Reporting results
+# ---------------------------------------------------------------------------
+#
+# A result is the only way Havenz learns that a reader did what it was asked. It used to be sent
+# once: if the backend refused it (HTTP 429 - twenty doors' results arriving together against a
+# limit sized for one gateway) or the uplink blinked, the agent logged a line and moved on, and the
+# backend, hearing nothing, recorded the command as "unknown" although the reader had done the
+# work. At the first plant rehearsal seventeen results of finished work were thrown away like that
+# during one enrolment.
+#
+# Now a result is held in an outbox until Havenz has it, with the same discipline as reader
+# events: written to an append-only journal in /data, sent, and only then marked done; retried
+# until it is delivered; picked up again after a restart.
+#
+#   {"v":1,"op":"put","rid":...,"id":"<command id>","at":...,"body":{...}}
+#   {"v":1,"op":"ack","rid":...,"at":...}                  Havenz has it
+#   {"v":1,"op":"drop","rid":...,"at":...,"reason":...}     given up on, and why
+#
+# Two deliberate differences from the event queue:
+#
+#   - The journal line is not fsynced before the first attempt to send. A result is sent the moment
+#     the reader has answered - somebody may be standing at a door waiting for it - so the line is
+#     handed to the operating system and the background thread fsyncs it within a second. A process
+#     that dies keeps it; a power cut in that second loses a result Havenz then records as unknown,
+#     which is the honest answer and exactly what happened to every result before this existed.
+#   - The result of a READ (the access log, the user list) is held in memory only. Reads are
+#     repeatable and the log read alone runs every thirty seconds per door; journalling them would
+#     put copies of reader logs on the disk to protect nothing. They are still retried, for as long
+#     as the agent is running and for at most ten minutes.
+
+RESULT_OUTBOX_VERSION = 1
+RESULT_MAX_PENDING = 5000
+RESULT_MAX_BYTES = 32 * 1024 * 1024
+RESULT_MAX_AGE_SECONDS = 24 * 3600
+RESULT_READ_MAX_AGE_SECONDS = 600
+RESULT_COMPACT_AFTER = 500
+RESULT_DELIVERY_WORKERS = 2
+
+# How long to wait after a 429 that did not say. Short: the backend's window is a minute at most
+# and it normally does say.
+RESULT_RETRY_AFTER_DEFAULT_SECONDS = 2
+# The key was revoked or the agent re-paired. Waiting does not fix that, but pairing again does,
+# and the results are still true - so they are kept and tried once a minute.
+RESULT_UNAUTHORISED_RETRY_SECONDS = 60
+# Havenz says the result itself is unacceptable (400, 413, 422). Retrying every second is pointless;
+# it is tried every five minutes until it is a day old, like a refused reader event.
+RESULT_REFUSAL_CODES = frozenset({400, 413, 422})
+RESULT_REFUSED_RETRY_SECONDS = 300
+
+# The longest any Retry-After is believed. A backend that asks for an hour has a problem of its
+# own; a door's result should not sit out an hour on its say-so.
+RETRY_AFTER_MAX_SECONDS = 60
+
+
+def retry_after_seconds(http_error, default):
     """
-    Work several doors at once, never more than the cap.
-
-    A plain thread-per-command would be fine for twenty and wrong for two hundred; a fixed pool
-    keeps the memory and socket count predictable on a small box regardless of how big a backlog
-    arrives after an outage.
+    How long a refusal asked us to wait, in seconds: its Retry-After header, capped, or `default`
+    when there is none or it cannot be read. Only the seconds form is understood - it is the only
+    one Havenz sends.
     """
-    queue = list(commands)
-    index = threading.Lock()
+    try:
+        value = (http_error.headers or {}).get("Retry-After")
+        seconds = int(str(value).strip())
+    except Exception:  # noqa: BLE001
+        return default
+    if seconds < 0:
+        return default
+    return min(seconds, RETRY_AFTER_MAX_SECONDS)
 
-    def worker():
-        while True:
-            with index:
-                if not queue:
-                    return
-                command = queue.pop(0)
-            handle(cfg, command)
 
-    threads = [threading.Thread(target=worker, daemon=True)
-               for _ in range(min(max_parallel, len(queue)))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+class ResultOutbox:
+    """Command results waiting to reach Havenz. Thread-safe; one instance per agent."""
+
+    def __init__(self, path, clock=time.time):
+        self.path = path
+        self._clock = clock
+        self._lock = threading.Condition()
+        self._pending = []            # records, oldest first
+        self._blocked_until = 0.0     # a 429 closes the door for everyone until then
+        self._file_lock = threading.Lock()
+        self._dirty = False
+        self._needs_newline = False
+        self._tail = None             # lines appended while a compaction writes its copy
+        self._closed_since_compact = 0
+        self.stats = {"delivered": 0, "dropped": 0, "refused_429": 0, "unpersisted": 0,
+                      "corrupt_lines": 0, "redelivered_after_restart": 0, "last_error": None}
+
+    # -- loading ----------------------------------------------------------
+
+    def load(self):
+        """Pick up the results the last process had not delivered. Never raises."""
+        puts, closed, corrupt, torn = {}, set(), 0, False
+        try:
+            with open(self.path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return 0
+        except Exception as e:  # noqa: BLE001
+            log.error("could not read the result outbox at %s (%s); starting empty - results that "
+                      "were waiting in it are NOT being delivered", self.path, e)
+            return 0
+
+        lines = raw.split(b"\n")
+        self._needs_newline = bool(raw) and not raw.endswith(b"\n")
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8"))
+                if rec.get("v") != RESULT_OUTBOX_VERSION:
+                    raise ValueError(f"version {rec.get('v')}")
+                op = rec["op"]
+                if op == "put":
+                    if not isinstance(rec["body"], dict):
+                        raise ValueError("body")
+                    puts[rec["rid"]] = self._record(rec["rid"], rec["id"], rec["body"], float(rec["at"]),
+                                                    durable=True, persisted=True, size=len(line))
+                elif op in ("ack", "drop"):
+                    closed.add(rec["rid"])
+            except Exception:  # noqa: BLE001
+                if index == len(lines) - 1 and self._needs_newline:
+                    torn = True          # the last line, cut short by a power loss
+                else:
+                    corrupt += 1
+
+        pending = [r for rid, r in puts.items() if rid not in closed]
+        pending.sort(key=lambda r: r["at"])
+        with self._lock:
+            self._pending = pending
+            self.stats["corrupt_lines"] += corrupt
+            self.stats["redelivered_after_restart"] = len(pending)
+
+        if torn:
+            log.warning("the result outbox ended in a half-written line (power lost mid-write); ignored")
+        if corrupt:
+            log.error("%d unreadable line(s) in the result outbox at %s were skipped", corrupt, self.path)
+        if pending:
+            log.warning("recovered %d command result(s) that had not reached Havenz before the "
+                        "restart (oldest %ds ago); sending them now",
+                        len(pending), int(self._clock() - pending[0]["at"]))
+        self._compact()
+        return len(pending)
+
+    @staticmethod
+    def _record(rid, command_id, body, at, durable, persisted, size):
+        return {"rid": rid, "id": command_id, "body": body, "at": at, "durable": durable,
+                "persisted": persisted, "size": size, "attempts": 0, "next_try": 0.0, "in_flight": False}
+
+    # -- writing ----------------------------------------------------------
+
+    def _append(self, entry):
+        """One journal line, handed to the operating system. The background sync fsyncs it."""
+        line = json.dumps(entry, separators=(",", ":")).encode("utf-8") + b"\n"
+        with self._file_lock:
+            with open(self.path, "ab") as f:
+                if self._needs_newline:
+                    f.write(b"\n")           # never glue a record onto a torn one
+                    self._needs_newline = False
+                f.write(line)
+                f.flush()
+            self._dirty = True
+            if self._tail is not None:
+                self._tail.append(line)      # a compaction is writing its copy; carry this over
+        return len(line)
+
+    def put(self, command_id, body, durable=True, hold=False):
+        """
+        Take custody of one result. Returns the record.
+
+        `durable=False` is for the result of a read: held in memory, never written. `hold=True`
+        hands the record to the caller already marked as being sent, so the caller can make the
+        first attempt itself (see report) without a retry thread racing it; the caller then calls
+        deliver() or release().
+
+        If the disk refuses the line the result is still held in memory and delivered, which is
+        what happened to every result before this outbox existed; it is logged and counted.
+        """
+        now = self._clock()
+        rec = self._record(str(uuid.uuid4()), command_id, body, now, durable, persisted=False, size=0)
+        rec["in_flight"] = bool(hold)
+        if durable:
+            try:
+                rec["size"] = self._append({"v": RESULT_OUTBOX_VERSION, "op": "put", "rid": rec["rid"],
+                                            "id": command_id, "at": now, "body": body})
+                rec["persisted"] = True
+            except Exception as e:  # noqa: BLE001
+                self.stats["unpersisted"] += 1
+                log.error("could NOT write the result of %s to the result outbox (%s); holding it "
+                          "in memory - it will be lost if the agent restarts before Havenz has it",
+                          command_id, e)
+        with self._lock:
+            self._pending.append(rec)
+            self._enforce_bounds_locked()
+            self._lock.notify_all()
+        return rec
+
+    def release(self, rec):
+        """Give a held record back without having tried it: a retry thread sends it when it may."""
+        with self._lock:
+            rec["in_flight"] = False
+            self._lock.notify_all()
+
+    def _close(self, rec, op, reason=None):
+        with self._lock:
+            if rec in self._pending:
+                self._pending.remove(rec)
+            rec["in_flight"] = False
+            self._closed_since_compact += 1
+            self._lock.notify_all()
+        if rec["persisted"]:
+            entry = {"v": RESULT_OUTBOX_VERSION, "op": op, "rid": rec["rid"], "at": self._clock()}
+            if reason:
+                entry["reason"] = reason
+            try:
+                # Losing an ack to a power cut costs one re-delivery, which Havenz answers
+                # "already recorded".
+                self._append(entry)
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not journal the %s of the result of %s (%s); it may be sent "
+                            "again after a restart", op, rec["id"], e)
+
+    def ack(self, rec):
+        self.stats["delivered"] += 1
+        self._close(rec, "ack")
+
+    def drop(self, rec, reason):
+        """Give up on a result - journalled, logged and counted; never silent."""
+        self.stats["dropped"] += 1
+        log.warning("DROPPED the result of command %s, held for %ds: %s (%d dropped since start). "
+                    "Havenz will record that command as unknown.",
+                    rec["id"], int(self._clock() - rec["at"]), reason, self.stats["dropped"])
+        self._close(rec, "drop", reason)
+
+    def _enforce_bounds_locked(self):
+        """Oldest out first when the outbox outgrows a small box. Caller holds the lock."""
+        def too_big():
+            return (len(self._pending) > RESULT_MAX_PENDING
+                    or sum(r["size"] for r in self._pending) > RESULT_MAX_BYTES)
+
+        while len(self._pending) > 1 and too_big():
+            victim = next((r for r in self._pending if not r["in_flight"]), None)
+            if victim is None:
+                return
+            self._lock.release()
+            try:
+                self.drop(victim, "the outbox is full (uplink down too long) - oldest result discarded")
+            finally:
+                self._lock.acquire()
+
+    def _compact(self):
+        """
+        Rewrite the journal as just what is still waiting. Temp file + replace, never in place.
+
+        The copy is written and fsynced without holding the file lock, so a reader's worker
+        appending its result meanwhile is not kept waiting on the disk; whatever was appended in
+        that time is carried over under the lock just before the copy is swapped in. Called at
+        load and from the background thread, never from a command's path.
+        """
+        tmp = self.path + ".tmp"
+        with self._file_lock:
+            if self._tail is not None:
+                return                       # another compaction is already writing its copy
+            if not os.path.exists(self.path):
+                return
+            with self._lock:
+                waiting = [{"v": RESULT_OUTBOX_VERSION, "op": "put", "rid": rec["rid"], "id": rec["id"],
+                            "at": rec["at"], "body": rec["body"]}
+                           for rec in self._pending if rec["persisted"]]
+                closed = self._closed_since_compact
+            self._tail = []
+        try:
+            with open(tmp, "wb") as f:
+                for entry in waiting:
+                    f.write(json.dumps(entry, separators=(",", ":")).encode("utf-8") + b"\n")
+                f.flush()
+                os.fsync(f.fileno())
+            with self._file_lock:
+                tail, self._tail = self._tail, None
+                if tail:
+                    # Lines written while the copy was being made. A put that is also in the copy
+                    # is then there twice under one record id, which loading reads as one result.
+                    with open(tmp, "ab") as f:
+                        f.writelines(tail)
+                        f.flush()
+                os.replace(tmp, self.path)
+                self._needs_newline = False
+                self._dirty = bool(tail)     # the carried-over lines still want their fsync
+            with self._lock:
+                self._closed_since_compact = max(0, self._closed_since_compact - closed)
+        except Exception as e:  # noqa: BLE001
+            with self._file_lock:
+                self._tail = None
+            log.warning("could not compact the result outbox at %s (%s); carrying on with the "
+                        "journal as it is", self.path, e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def sync(self):
+        """
+        What the background thread does every second: fsync what was appended, compact if due.
+        The disk is never waited on under the file lock - a worker appending a result must not
+        queue behind this.
+        """
+        if self._closed_since_compact >= RESULT_COMPACT_AFTER:
+            self._compact()
+        with self._file_lock:
+            dirty, self._dirty = self._dirty, False
+        if not dirty:
+            return
+        try:
+            with open(self.path, "ab") as f:
+                os.fsync(f.fileno())
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not sync the result outbox at %s (%s)", self.path, e)
+
+    # -- sending ----------------------------------------------------------
+
+    def blocked(self):
+        """True while a 429's Retry-After is still running. Nothing is sent until it has passed."""
+        with self._lock:
+            return self._clock() < self._blocked_until
+
+    def take(self, timeout=None):
+        """The next result that may be sent now, marked as being sent - or None after `timeout`."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lock:
+            while True:
+                now = self._clock()
+                expired = [r for r in self._pending if not r["in_flight"] and now - r["at"] >
+                           (RESULT_MAX_AGE_SECONDS if r["durable"] else RESULT_READ_MAX_AGE_SECONDS)]
+                if expired:
+                    self._lock.release()
+                    try:
+                        for rec in expired:
+                            self.drop(rec, "undelivered for a day" if rec["durable"]
+                                      else "the result of a read, undelivered for ten minutes")
+                    finally:
+                        self._lock.acquire()
+                    continue
+
+                wake_in = None
+                if now < self._blocked_until:
+                    wake_in = self._blocked_until - now
+                else:
+                    for rec in self._pending:
+                        if rec["in_flight"]:
+                            continue
+                        if rec["next_try"] <= now:
+                            rec["in_flight"] = True
+                            return rec
+                        wait = rec["next_try"] - now
+                        wake_in = wait if wake_in is None else min(wake_in, wait)
+
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                waits = [w for w in (wake_in, remaining) if w is not None]
+                self._lock.wait(min(waits) if waits else None)
+
+    def _retry_later(self, rec, delay, error, block_everyone=False):
+        with self._lock:
+            now = self._clock()
+            rec["next_try"] = now + delay
+            rec["in_flight"] = False
+            self.stats["last_error"] = error
+            if block_everyone:
+                self._blocked_until = max(self._blocked_until, now + delay)
+            self._lock.notify_all()
+
+    def deliver(self, cfg, rec, post=None):
+        """
+        One attempt to hand a result to Havenz, settled in the outbox. Returns the outcome:
+        "ok", "dropped", or what stopped it ("rate_limited", "retry", "unauthorised", "refused").
+        """
+        post = post or post_result
+        try:
+            answer = post(cfg, rec)
+        except Exception as e:  # noqa: BLE001 - whatever went wrong, the result is still ours to deliver
+            answer = ("retry", f"agent error: {e}", None)
+        outcome, detail = answer[0], answer[1]
+        asked = answer[2] if len(answer) > 2 else None
+        attempts = rec["attempts"]
+        rec["attempts"] = attempts + 1
+
+        if outcome == "ok":
+            self.ack(rec)
+            if attempts:
+                log.info("reported the result of %s on attempt %d, %ds after the reader answered",
+                         rec["id"], attempts + 1, int(self._clock() - rec["at"]))
+            return outcome
+
+        if outcome == "gone":
+            # 404: Havenz has no such command for this agent (the agent was re-paired, or the
+            # backend's database was replaced). Nobody is waiting for this and nobody ever will.
+            log.warning("could not report the result of %s (%s) - Havenz has no such command for "
+                        "this agent, so it is not kept", rec["id"], detail)
+            self.drop(rec, f"Havenz has no such command for this agent ({detail})")
+            return "dropped"
+
+        if outcome == "rate_limited":
+            self.stats["refused_429"] += 1
+            delay = asked if asked is not None else RESULT_RETRY_AFTER_DEFAULT_SECONDS
+        elif outcome == "unauthorised":
+            delay = RESULT_UNAUTHORISED_RETRY_SECONDS
+        elif outcome == "refused":
+            delay = RESULT_REFUSED_RETRY_SECONDS
+        else:
+            delay = min(BACKOFF_MAX_SECONDS, 2 ** min(attempts, 6))
+
+        # Worded for the people who read this log and for the rehearsal that counts it: the result
+        # was refused or could not be sent, it has NOT been thrown away, and when it goes again.
+        log.warning("could not report the result of %s (%s) - kept, retrying in %ds",
+                    rec["id"], detail, delay)
+        self._retry_later(rec, delay, detail, block_everyone=(outcome == "rate_limited"))
+        return outcome
+
+    def snapshot(self):
+        with self._lock:
+            now = self._clock()
+            oldest = self._pending[0]["at"] if self._pending else None
+            return {
+                "pending": len(self._pending),
+                "oldest_age_seconds": None if oldest is None else int(now - oldest),
+                "blocked_for_seconds": max(0, int(self._blocked_until - now + 0.999)),
+                **self.stats,
+            }
+
+
+def post_result(cfg, rec):
+    """
+    One attempt to POST a result. Returns (outcome, detail, retry_after):
+    "ok" | "rate_limited" | "gone" | "unauthorised" | "refused" | "retry".
+
+    A 200 is success whatever its body says: `accepted: false` means Havenz already had this
+    result, which is exactly what a retry after a lost answer should be told.
+    """
+    try:
+        backend_post(cfg, f"/api/agent/commands/{rec['id']}/result", rec["body"], timeout=15)
+        return "ok", None, None
+    except urllib.error.HTTPError as e:
+        detail = str(e)                      # "HTTP Error 429: Too Many Requests"
+        if e.code == 429:
+            return "rate_limited", detail, retry_after_seconds(e, RESULT_RETRY_AFTER_DEFAULT_SECONDS)
+        if e.code == 404:
+            return "gone", detail, None
+        if e.code in (401, 403):
+            return "unauthorised", detail, None
+        if e.code in RESULT_REFUSAL_CODES:
+            return "refused", detail, None
+        return "retry", detail, None
+    except Exception as e:  # noqa: BLE001
+        return "retry", str(e), None
+
+
+def result_delivery_loop(cfg, outbox):
+    """One retry worker. Runs for as long as `outbox` is the agent's outbox."""
+    while STATE.get("result_outbox") is outbox:
+        try:
+            rec = outbox.take(timeout=5)
+            if rec is not None:
+                outbox.deliver(cfg, rec)
+        except Exception:  # noqa: BLE001 - this loop must outlive everything
+            log.exception("result delivery worker hit an unexpected error; carrying on")
+            time.sleep(1)
+
+
+_result_outbox_lock = threading.Lock()
+
+
+def result_outbox(cfg):
+    """
+    The agent's result outbox, opened (and whatever was waiting in it recovered) on first use.
+
+    main() opens it before any command can be leased. It is also opened on demand so that a result
+    can never be reported into nothing, whichever way the agent was started.
+    """
+    path = cfg.get("result_outbox_path") or "/data/results.jsonl"
+    with _result_outbox_lock:
+        outbox = STATE.get("result_outbox")
+        if outbox is None or outbox.path != path:
+            outbox = ResultOutbox(path)
+            outbox.load()
+            STATE["result_outbox"] = outbox
+            for _ in range(RESULT_DELIVERY_WORKERS):
+                threading.Thread(target=result_delivery_loop, args=(cfg, outbox), daemon=True).start()
+            _flusher_start()
+        return outbox
+
+
+# Which kind of command the current thread is carrying out, so report() can tell the result of a
+# read (kept in memory) from the result of work (journalled) without every caller having to say.
+_in_hand = threading.local()
 
 
 def report(cfg, command_id, success, result, error, duration_ms, outcome=None):
     """
-    Send the outcome back. A failure to report is logged, not raised — the work is already done.
+    Send the outcome back, and keep it until Havenz has it. Never raises.
+
+    The first attempt is made here, at once, on the reader's own worker thread - the common case is
+    one POST and nothing else. If Havenz refuses it or cannot be reached, the result stays in the
+    outbox and the retry threads send it; if a 429 has already closed the door, it goes straight to
+    them rather than knocking again.
 
     `outcome="unknown"` says the command reached the reader and nothing came back. A backend that
     does not know the field ignores it and records a failure, exactly as before.
@@ -1315,11 +2130,15 @@ def report(cfg, command_id, success, result, error, duration_ms, outcome=None):
     if outcome:
         body["outcome"] = outcome
     try:
-        backend_post(cfg, f"/api/agent/commands/{command_id}/result", body, timeout=15)
-    except Exception as e:  # noqa: BLE001
-        # The backend will reap this as 'unknown', which is the honest outcome: the reader may
-        # well have acted and we could not say so.
-        log.warning("could not report the result of %s (%s)", command_id, e)
+        outbox = result_outbox(cfg)
+        durable = getattr(_in_hand, "kind", None) not in READ_ONLY_COMMANDS
+        rec = outbox.put(command_id, body, durable=durable, hold=True)
+        if outbox.blocked():
+            outbox.release(rec)
+            return
+        outbox.deliver(cfg, rec)
+    except Exception:  # noqa: BLE001 - the work is already done; reporting must not undo it
+        log.exception("could not report the result of %s", command_id)
 
 
 # Per-terminal health, so one dead reader does not spoil the site.
@@ -1358,32 +2177,103 @@ def breaker_record(terminal_id, ok, name=""):
                     name or terminal_id, state["failures"], BREAKER_COOLDOWN_SECONDS)
 
 
-def command_loop(cfg):
-    """Hold a long poll open, execute whatever arrives, repeat."""
+# Polls START at least this far apart.
+#
+# An idle agent holds one long poll open and this never applies: the poll that brings an unlock
+# was already waiting, and the next one starts the moment it returns. Under load it is what keeps
+# the agent from asking once per command - a poll that returns at once is followed by a short
+# pause, so the next one collects whatever several doors have become ready for in the meantime.
+# The cost is at most this much added to a command that arrives in the gap, during a busy spell.
+POLL_MIN_INTERVAL_SECONDS = 0.2
+
+# A reader's worker that has had nothing to do for this long goes away; the next command for that
+# door starts another. Keeps a terminal that was removed from holding a thread for ever.
+READER_WORKER_IDLE_SECONDS = 600
+
+
+class ReaderWorkers:
+    """
+    One worker per reader, each with its own queue.
+
+    The agent used to ask for work, do ALL of it, and only then ask again. While it waited out a
+    reader that had accepted a connection and gone silent - ten seconds - it was not asking, so a
+    remote unlock for any other door sat in Havenz's queue for the whole of that timeout, and an
+    unlock only lives ten seconds. Measured at the first plant rehearsal: a healthy door opened in
+    9.2 s beside a hanging one, against 0.27 s normally.
+
+    Now the poller only hands commands out. Each reader's commands are carried out by that
+    reader's own thread, in the order they arrived, so a reader that hangs holds up nothing but
+    itself - and one reader is still never sent two commands at once, which is the ordering the
+    backend's dispatch relies on ("grant Mike" then "revoke Mike" must not invert).
+
+    One thread per reader is the bound on parallel work. They are idle almost all the time; twenty
+    readers are twenty parked threads.
+    """
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self._lock = threading.Lock()
+        self._queues = {}
+
+    def submit(self, command):
+        """Hand a command to its reader's worker, starting one if that reader has none."""
+        terminal_id = command.get("terminalId")
+        with self._lock:
+            queue = self._queues.get(terminal_id)
+            if queue is None:
+                queue = self._queues[terminal_id] = Queue()
+                threading.Thread(target=self._run, args=(terminal_id, queue), daemon=True,
+                                 name=f"reader-{terminal_id}").start()
+            # Put under the lock, so a worker deciding it is idle cannot retire between our
+            # finding its queue and using it.
+            queue.put(command)
+
+    def _run(self, terminal_id, queue):
+        while True:
+            try:
+                command = queue.get(timeout=READER_WORKER_IDLE_SECONDS)
+            except Empty:
+                with self._lock:
+                    if queue.empty():
+                        self._queues.pop(terminal_id, None)
+                        return
+                continue
+            try:
+                handle(self._cfg, command)
+            except Exception:  # noqa: BLE001 - handle() never raises; this worker must outlive it if it does
+                log.exception("the worker for terminal %s hit an unexpected error; carrying on", terminal_id)
+
+
+def command_loop(cfg, workers=None):
+    """Hold a long poll open, hand whatever arrives to the readers' workers, and ask again at once."""
     wait = int(cfg.get("command_wait_seconds", 25))
-    # Capped so twenty doors cannot put twenty simultaneous HTTP calls through a small box. The
-    # backend already allows at most one command per terminal in flight, so this bounds how many
-    # DOORS are worked at once, not how deep any one door's queue runs.
-    max_parallel = int(cfg.get("max_parallel_terminals", 8))
+    workers = workers or ReaderWorkers(cfg)
     backoff = BACKOFF_START_SECONDS
+    last_started = None
 
     while True:
+        if last_started is not None:
+            gap = POLL_MIN_INTERVAL_SECONDS - (time.monotonic() - last_started)
+            if gap > 0:
+                time.sleep(gap)
+        last_started = time.monotonic()
         try:
             batch = backend_get(cfg, f"/api/agent/commands?wait={wait}", timeout=wait + 15)
             backoff = BACKOFF_START_SECONDS
-            commands = batch.get("commands") or []
-
-            if len(commands) <= 1:
-                for command in commands:
-                    handle(cfg, command)
-            else:
-                # One command per terminal, so running them together cannot reorder anything for a
-                # given door — the ordering guarantee lives in the backend's dispatch.
-                run_in_parallel(cfg, commands, max_parallel)
+            # Never executed here. The backend hands out at most one command per terminal at a
+            # time, and each goes to that terminal's own worker, so nothing can reorder a door's
+            # work and nothing one door does can delay the next poll.
+            for command in batch.get("commands") or []:
+                workers.submit(command)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 log.error("no longer authorised to collect commands (HTTP %d)", e.code)
                 time.sleep(BACKOFF_MAX_SECONDS)
+            elif e.code == 429:
+                # Told how long to stay away, so stay away exactly that long instead of guessing.
+                delay = retry_after_seconds(e, backoff)
+                log.warning("command poll failed (HTTP %d) — retrying in %ds", e.code, delay)
+                time.sleep(delay)
             else:
                 log.warning("command poll failed (HTTP %d) — retrying in %ds", e.code, backoff)
                 time.sleep(backoff)
@@ -1478,6 +2368,26 @@ EVENT_MAX_BODY_BYTES = 4 * 1024 * 1024
 EVENT_COMPACT_AFTER = 500
 EVENT_DELIVERY_WORKERS = 4
 
+# How long a reader's post waits for its event to be confirmed on disk before it is answered anyway.
+#
+# The reader allows five seconds (Reader.configure_monitor sets request_timeout to 5000 ms). In
+# every normal case the order is still: on disk first, reader answered second - the journal's
+# writer confirms a batch in milliseconds. This bound is for the disk that stalls. Past three
+# seconds we choose answering over waiting, and the trade is deliberate:
+#
+#   - A reader that times out has behaviour nobody has observed. It may retry, it may give up, it
+#     may do something worse; a simulation cannot say and the bench has one reader.
+#   - An event answered before its line is on disk is not lost. It is in memory, it is being
+#     delivered to Havenz, and its line is still queued for the disk. It is lost only if the agent
+#     dies in that same moment - and even then it is still in the reader's own log, which Havenz
+#     reads every thirty seconds.
+#
+# Every time it happens it is counted (answered_before_durable on the status page) and logged.
+EVENT_ACK_WAIT_SECONDS = 3.0
+
+# The journal's writer thread goes away after this long with nothing to write.
+EVENT_WRITER_IDLE_SECONDS = 30.0
+
 # The reader's keepalive is never queued. Delivered an hour late it would tell Havenz "this reader
 # spoke just now" about a reader that may since have died - the opposite of what it is for.
 EVENT_UNQUEUED_KINDS = frozenset({"device_is_alive"})
@@ -1503,9 +2413,18 @@ class EventQueue:
         self._pending = []            # records, oldest first
         self._in_flight = set()       # terminal ids with a delivery in progress
         self._closed_since_compact = 0
+        self._compact_queued = False
         self._needs_newline = False
+        # The journal's writer: one thread, one queue of lines waiting for the disk. See _enqueue.
+        self._file_lock = threading.Lock()
+        self._wcond = threading.Condition()
+        self._wqueue = []
+        self._writing = False
+        self._writer = None
+        self._slow_disk_warned_at = 0.0
         self.stats = {"delivered": 0, "dropped": 0, "unpersisted": 0, "corrupt_lines": 0,
-                      "redelivered_after_restart": 0, "last_error": None}
+                      "redelivered_after_restart": 0, "answered_before_durable": 0,
+                      "last_error": None}
 
     # -- loading ----------------------------------------------------------
 
@@ -1579,23 +2498,128 @@ class EventQueue:
         return len(pending)
 
     # -- writing ----------------------------------------------------------
+    #
+    # One thread writes the journal, and it writes in batches.
+    #
+    # Every event used to be appended and fsynced by the thread answering its reader, under the
+    # queue's one lock. Twenty doors posting in the same second therefore waited for twenty writes
+    # in a row; at the quarter of a second a write the first plant rehearsal measured on slow
+    # storage, the last reader had waited out its five seconds and hung up before it was answered
+    # (316 of 1,760 posts in a thirty-minute soak). Nothing was lost - every one of those events
+    # was kept and delivered - but what a real reader does after such a timeout is not known.
+    #
+    # Now the answering thread only queues its line. The writer takes everything that is queued,
+    # writes it in one go and fsyncs ONCE for the lot, then releases every thread waiting on it.
+    # Twenty doors in one second wait for one or two fsyncs, not twenty. Acks ride the same writer
+    # and nobody waits for them. Compaction runs here too, so there is only ever one writer.
 
-    def _append(self, record, durable):
-        """Append one journal line. `durable` means fsync before returning."""
-        line = json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
-        with open(self.path, "ab") as f:
-            if self._needs_newline:
-                f.write(b"\n")           # never glue a record onto a torn one
-                self._needs_newline = False
-            f.write(line)
-            f.flush()
-            if durable:
-                os.fsync(f.fileno())
+    def _enqueue(self, entry=None, rec=None, durable=False, wait=False, compact=False):
+        """
+        Queue one journal line (or a compaction) for the writer. Returns the queued item; with
+        `wait`, its "done" event is set once the line has been written (or has failed to be).
+        """
+        item = {
+            "line": None if entry is None else json.dumps(entry, separators=(",", ":")).encode("utf-8") + b"\n",
+            "op": None if entry is None else entry["op"],
+            "rec": rec, "durable": durable, "compact": compact,
+            "done": threading.Event() if wait else None,
+        }
+        with self._wcond:
+            self._wqueue.append(item)
+            if self._writer is None or not self._writer.is_alive():
+                self._writer = threading.Thread(target=self._write_loop, daemon=True, name="event-journal")
+                self._writer.start()
+            self._wcond.notify_all()
+        return item
+
+    def _write_loop(self):
+        """The writer. Goes away when it has been idle a while; the next line starts another."""
+        while True:
+            with self._wcond:
+                idle_since = time.monotonic()
+                while not self._wqueue:
+                    self._wcond.wait(EVENT_WRITER_IDLE_SECONDS)
+                    if not self._wqueue and time.monotonic() - idle_since >= EVENT_WRITER_IDLE_SECONDS:
+                        self._writer = None
+                        return
+                batch, self._wqueue = self._wqueue, []
+                self._writing = True
+            try:
+                lines = []
+                for item in batch:
+                    if item["compact"]:
+                        self._write_lines(lines)
+                        lines = []
+                        self._compact()
+                    else:
+                        lines.append(item)
+                self._write_lines(lines)
+            except Exception:  # noqa: BLE001 - the writer must outlive everything
+                log.exception("the event journal's writer hit an unexpected error; carrying on")
+            finally:
+                for item in batch:
+                    if item["done"] is not None:
+                        item["done"].set()
+                with self._wcond:
+                    self._writing = False
+                    self._wcond.notify_all()
+
+    def _write_lines(self, items):
+        """Append a batch of lines with one write and - if any of them needs it - one fsync."""
+        if not items:
+            return
+        try:
+            with self._file_lock:
+                with open(self.path, "ab") as f:
+                    if self._needs_newline:
+                        f.write(b"\n")           # never glue a record onto a torn one
+                        self._needs_newline = False
+                    f.write(b"".join(item["line"] for item in items))
+                    f.flush()
+                    # Puts and drops are durable. A batch of nothing but acks is not fsynced:
+                    # losing an ack to a power cut costs one re-delivery, which Havenz
+                    # de-duplicates, and fsyncing every one would double the SD-card writes.
+                    if any(item["durable"] for item in items):
+                        os.fsync(f.fileno())
+        except Exception as e:  # noqa: BLE001
+            for item in items:
+                rec = item["rec"]
+                if item["op"] == "put":
+                    rec["persisted"] = False
+                    self.stats["unpersisted"] += 1
+                    log.error("could NOT write a %s event from terminal %s to the event queue (%s); "
+                              "holding it in memory - it will be lost if the agent restarts before "
+                              "Havenz has it", rec["kind"], rec["terminalId"], e)
+                else:
+                    log.warning("could not journal the %s of event %s (%s); it may be delivered "
+                                "again after a restart", item["op"], rec["id"], e)
+        finally:
+            for item in items:
+                if item["done"] is not None:
+                    item["done"].set()
+
+    def flush(self, timeout=30.0):
+        """
+        Block until everything queued for the journal has been written. For shutdown and for tests;
+        nothing on a reader's path calls it. Returns False if the disk did not get there in time.
+        """
+        deadline = time.monotonic() + timeout
+        with self._wcond:
+            while self._wqueue or self._writing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._wcond.wait(remaining)
+        return True
 
     def put(self, terminal_id, kind, body):
         """
-        Take custody of one event. Returns once it is on disk - the caller answers the reader
-        only after this.
+        Take custody of one event. The caller answers the reader when this returns.
+
+        It returns once the event's line is on disk - write-before-answer, as in 0.5.0 - for as
+        long as the disk answers within EVENT_ACK_WAIT_SECONDS. Past that it returns anyway (see
+        the comment on that constant for the trade). Either way the event is in the in-memory queue
+        from the first moment, so its delivery to Havenz does not wait for the disk.
 
         If the disk write fails the event is kept in memory and delivered anyway, which is exactly
         what happened to every event before this queue existed; it is logged and counted, because
@@ -1609,19 +2633,27 @@ class EventQueue:
             "refused_since": None, "mono": time.monotonic(), "size": len(encoded),
         }
         with self._lock:
-            try:
-                self._append({"v": EVENT_QUEUE_VERSION, "op": "put", "id": rec["id"],
-                              "terminalId": rec["terminalId"], "kind": kind,
-                              "receivedAt": now, "body": encoded}, durable=True)
-            except Exception as e:  # noqa: BLE001
-                rec["persisted"] = False
-                self.stats["unpersisted"] += 1
-                log.error("could NOT write a %s event from terminal %s to the event queue (%s); "
-                          "holding it in memory - it will be lost if the agent restarts before "
-                          "Havenz has it", kind, terminal_id, e)
             self._pending.append(rec)
+            # Queued under the same lock that put it in the pending list, so the journal holds a
+            # door's events in the order its reader sent them and a put always precedes its ack.
+            item = self._enqueue({"v": EVENT_QUEUE_VERSION, "op": "put", "id": rec["id"],
+                                  "terminalId": rec["terminalId"], "kind": kind,
+                                  "receivedAt": now, "body": encoded},
+                                 rec=rec, durable=True, wait=True)
             self._enforce_bounds_locked()
             self._lock.notify_all()
+
+        if not item["done"].wait(EVENT_ACK_WAIT_SECONDS):
+            self.stats["answered_before_durable"] += 1
+            mono = time.monotonic()
+            if mono - self._slow_disk_warned_at >= 10:
+                self._slow_disk_warned_at = mono
+                log.warning("the disk took more than %.0fs to confirm a %s event from terminal %s; "
+                            "answering the reader now so it does not time out. The event is held in "
+                            "memory and is being delivered; its line is still queued for the disk "
+                            "(%d answered this way since start)",
+                            EVENT_ACK_WAIT_SECONDS, kind, terminal_id,
+                            self.stats["answered_before_durable"])
         return rec
 
     def _close(self, rec, op, reason=None):
@@ -1633,18 +2665,14 @@ class EventQueue:
                 entry = {"v": EVENT_QUEUE_VERSION, "op": op, "id": rec["id"], "at": self._clock()}
                 if reason:
                     entry["reason"] = reason
-                try:
-                    # Not fsynced. Losing an ack to a power cut costs one re-delivery, which
-                    # Havenz de-duplicates; fsyncing every one would double the SD-card writes.
-                    self._append(entry, durable=(op == "drop"))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("could not journal the %s of event %s (%s); it may be delivered "
-                                "again after a restart", op, rec["id"], e)
+                # Written by the journal's writer, and never waited for. A drop is fsynced with
+                # its batch; an ack is not (see _write_lines).
+                self._enqueue(entry, rec=rec, durable=(op == "drop"))
             self._closed_since_compact += 1
-            compact = self._closed_since_compact >= EVENT_COMPACT_AFTER
+            if self._closed_since_compact >= EVENT_COMPACT_AFTER and not self._compact_queued:
+                self._compact_queued = True
+                self._enqueue(compact=True)
             self._lock.notify_all()
-        if compact:
-            self._compact()
 
     def ack(self, rec):
         self.stats["delivered"] += 1
@@ -1696,23 +2724,31 @@ class EventQueue:
                 self._lock.acquire()
 
     def _compact(self):
-        """Rewrite the journal as just what is still waiting. Temp file + replace, never in place."""
-        with self._lock:
+        """
+        Rewrite the journal as just what is still waiting. Temp file + replace, never in place.
+
+        Runs at load, and afterwards only on the writer's thread, so it never competes with an
+        append. Lines still queued behind it are appended to the new file afterwards: a put that is
+        also in the copy is then there twice under one id, which loading reads as one event.
+        """
+        with self._file_lock:
+            with self._lock:
+                waiting = [{"v": EVENT_QUEUE_VERSION, "op": "put", "id": rec["id"],
+                            "terminalId": rec["terminalId"], "kind": rec["kind"],
+                            "receivedAt": rec["receivedAt"], "body": rec["body"]}
+                           for rec in self._pending if rec["persisted"]]
+                closed = self._closed_since_compact
+                self._compact_queued = False
             tmp = self.path + ".tmp"
             try:
                 with open(tmp, "wb") as f:
-                    for rec in self._pending:
-                        if not rec["persisted"]:
-                            continue
-                        f.write(json.dumps({
-                            "v": EVENT_QUEUE_VERSION, "op": "put", "id": rec["id"],
-                            "terminalId": rec["terminalId"], "kind": rec["kind"],
-                            "receivedAt": rec["receivedAt"], "body": rec["body"]},
-                            separators=(",", ":")).encode("utf-8") + b"\n")
+                    for entry in waiting:
+                        f.write(json.dumps(entry, separators=(",", ":")).encode("utf-8") + b"\n")
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.path)
-                self._closed_since_compact = 0
+                with self._lock:
+                    self._closed_since_compact = max(0, self._closed_since_compact - closed)
                 self._needs_newline = False
             except Exception as e:  # noqa: BLE001
                 log.warning("could not compact the event queue at %s (%s); carrying on with the "
@@ -1828,7 +2864,8 @@ def event_headers(cfg, rec, age_ms, attempt):
 
 def post_event(cfg, rec, age_ms, attempt):
     """
-    One attempt to hand an event to Havenz. Returns ("ok" | "retry" | "refused", detail).
+    One attempt to hand an event to Havenz. Returns ("ok" | "retry" | "refused", detail), with a
+    third element - seconds to stay away - when Havenz refused it with 429 and said how long.
 
     The payload goes up byte for byte as the reader sent it - parsing, idempotency and
     broadcasting all stay in the one implementation on the backend that already gets them right.
@@ -1843,6 +2880,8 @@ def post_event(cfg, rec, age_ms, attempt):
         return "ok", None
     except urllib.error.HTTPError as e:
         detail = f"HTTP {e.code}"
+        if e.code == 429:
+            return "retry", detail, retry_after_seconds(e, None)
         return ("refused" if e.code in EVENT_REFUSAL_CODES else "retry"), detail
     except Exception as e:  # noqa: BLE001
         return "retry", str(e)
@@ -1852,7 +2891,9 @@ def deliver_one(cfg, queue, rec, post=None):
     """Deliver one taken event and settle it in the queue. Returns the outcome."""
     post = post or post_event
     attempt = rec["attempts"] + 1
-    outcome, detail = post(cfg, rec, queue.age_ms(rec), attempt)
+    answer = post(cfg, rec, queue.age_ms(rec), attempt)
+    outcome, detail = answer[0], answer[1]
+    asked = answer[2] if len(answer) > 2 else None
 
     if outcome == "ok":
         queue.delivered_attempt(rec)
@@ -1878,6 +2919,8 @@ def deliver_one(cfg, queue, rec, post=None):
 
     # An outage, not a refusal: keep it, back off, keep trying until the uplink is back.
     delay = min(BACKOFF_MAX_SECONDS, 2 ** min(rec["attempts"], 6))
+    if asked:
+        delay = max(delay, asked)            # a 429 said how long; do not come back sooner
     if rec["attempts"] in (0, 3) or rec["attempts"] % 20 == 0:
         log.warning("could not relay %s from terminal %s (%s) - it is safe on disk; trying again "
                     "in %ds", rec["kind"], rec["terminalId"], detail, delay)
@@ -2073,11 +3116,14 @@ the Havenz app). This agent will stop serving the current property immediately.<
       else if (s.seconds_since_heartbeat === null) { conn.className='ok'; conn.textContent='Connecting\\u2026'; }
       else { conn.className='ok'; conn.textContent='\\u2713 Connected to Havenz'; }
       const ev = s.events || {};
+      const rs = s.results || {};
       detail.textContent = (s.seconds_since_heartbeat === null ? ''
         : 'Last contact ' + s.seconds_since_heartbeat + 's ago' +
           (s.site_name ? ' \\u2014 ' + s.site_name : '')) +
         (ev.pending ? ' \\u2014 ' + ev.pending + ' door event(s) waiting to be sent' : '') +
-        (ev.dropped ? ' \\u2014 ' + ev.dropped + ' dropped' : '');
+        (ev.dropped ? ' \\u2014 ' + ev.dropped + ' dropped' : '') +
+        (rs.pending ? ' \\u2014 ' + rs.pending + ' result(s) waiting to be sent' : '') +
+        (rs.dropped ? ' \\u2014 ' + rs.dropped + ' result(s) dropped' : '');
       document.getElementById('terms').innerHTML = (s.terminals||[]).length
         ? s.terminals.map(t => '<li><span>' + t.name + '</span><span>' + (t.ipAddress||'') + '</span></li>').join('')
         : '<li><span>No doors assigned to this agent yet</span><span></span></li>';
@@ -2125,6 +3171,8 @@ def start_web_server(cfg_path, cfg, port, paired_event):
                     "terminals": STATE["terminals"],
                     # Reader events still waiting to reach Havenz, and anything given up on.
                     "events": STATE["event_queue"].snapshot() if STATE.get("event_queue") else None,
+                    # Command results still waiting to reach Havenz, and anything given up on.
+                    "results": STATE["result_outbox"].snapshot() if STATE.get("result_outbox") else None,
                 }))
             html = STATUS_HTML if cfg.get("hub_key") else SETUP_HTML
             self._send(200, html, "text/html; charset=utf-8")
@@ -2208,8 +3256,14 @@ def main():
     except Exception as e:  # noqa: BLE001
         log.warning("could not load the reader list at startup (%s); will retry", e)
 
-    # Commands run on their own thread. The heartbeat must keep reporting while a reader is being
-    # slow, and an unlock must not wait behind a heartbeat — separate concerns, separate threads.
+    # Before any command can be leased: whatever results the last process had not delivered go up
+    # now, and the thread that syncs the journals is running.
+    result_outbox(cfg)
+    _flusher_start()
+
+    # Commands are collected on their own thread and carried out on one thread per reader. The
+    # heartbeat must keep reporting while a reader is being slow, an unlock must not wait behind a
+    # heartbeat, and one door must not wait behind another — separate concerns, separate threads.
     threading.Thread(target=command_loop, args=(cfg,), daemon=True).start()
 
     # Discovery gets its own thread too: a sweep of 254 addresses takes seconds, and no door should

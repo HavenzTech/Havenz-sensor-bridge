@@ -156,6 +156,7 @@ def test_a_delivered_event_is_acknowledged_in_the_journal_and_leaves_the_queue(c
 
     assert agent.deliver_one(cfg, queue, queue.take(timeout=0), post=havenz) == "ok"
 
+    queue.flush()                                  # acks are written behind the delivery, not waited for
     assert [r["op"] for r in journal(path)] == ["put", "ack"]
     assert queue.snapshot()["pending"] == 0
     assert havenz.received[0]["id"] == rec["id"] and havenz.received[0]["attempt"] == 1
@@ -177,6 +178,7 @@ def test_a_restart_before_delivery_loses_nothing(cfg, path):
 
     assert [r["body"] for r in havenz.received] == [b"scan-1", b"scan-2", b"scan-3"]
     assert after.snapshot()["pending"] == 0
+    after.flush()
     assert agent.EventQueue(path).load() == 0, "and a second restart finds nothing left to send"
 
 
@@ -219,6 +221,7 @@ def test_an_outage_keeps_the_event_and_retries_until_it_ends(cfg, path):
     assert agent.deliver_one(cfg, queue, queue.take(timeout=0), post=havenz) == "ok"
 
     assert [r["attempt"] for r in havenz.received] == [1, 2, 3]
+    queue.flush()
     assert [r["op"] for r in journal(path)] == ["put", "ack"]
 
 
@@ -287,6 +290,7 @@ def test_a_refused_door_does_not_hold_up_the_other_doors(cfg, path):
     assert agent.deliver_one(cfg, queue, queue.take(timeout=0), post=Havenz(("refused", "HTTP 403"))) == "dropped"
 
     assert queue.snapshot()["dropped"] == 1
+    queue.flush()
     assert journal(path)[-1]["op"] == "drop" and "403" in journal(path)[-1]["reason"]
     dead = [json.loads(line) for line in Path(path + ".dead").read_text().splitlines()]
     assert base64.b64decode(dead[0]["body"]) == b"a1", "a dropped event is kept where someone can find it"
@@ -330,6 +334,7 @@ def test_the_journal_is_compacted_so_it_stays_the_size_of_what_is_waiting(cfg, p
     for _ in range(3):
         agent.deliver_one(cfg, queue, queue.take(timeout=0), post=Havenz())
 
+    queue.flush()                                  # compaction runs on the journal's writer thread
     lines = journal(path)
     assert [r["op"] for r in lines] == ["put"], "three delivered and compacted away, one still waiting"
     assert base64.b64decode(lines[0]["body"]) == b"scan-3"
@@ -343,6 +348,7 @@ def test_a_full_queue_drops_the_oldest_and_says_so(path, monkeypatch):
 
     snapshot = queue.snapshot()
     assert snapshot["pending"] == 3 and snapshot["dropped"] == 2
+    queue.flush()
     assert [r["op"] for r in journal(path)].count("drop") == 2, "never silently"
     assert base64.b64decode(queue.take(timeout=0)["body"]) == b"scan-2", "the newest are the ones kept"
 
@@ -470,7 +476,7 @@ def test_reads_are_not_written_to_the_executed_store(tmp_path, monkeypatch):
 
     agent.handle(cfg, {"id": "cmd-read", "type": "GetAccessLogs", "terminalId": DOOR_A,
                        "notValidAfter": "2099-01-01T00:00:00Z"})
-    assert agent._executed == {} and not Path(cfg["executed_store_path"]).exists()
+    assert agent._executed == {} and not Path(agent.executed_store_path(cfg)).exists()
 
     agent.handle(cfg, {"id": "cmd-open", "intentId": "tap-1", "type": "OpenDoor", "terminalId": DOOR_A,
                        "notValidAfter": "2099-01-01T00:00:00Z"})

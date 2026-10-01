@@ -1,0 +1,147 @@
+# The plant rehearsal stack. Its own compose project, its own database, its own ports.
+#
+# Nothing here shares a container, a volume or a port with the development stack (havenz_api :5000,
+# havenz_db :5433), and nothing here can reach a production service: every outbound address the
+# backend knows is either pointed at a local stand-in or black-holed (see `extra_hosts` on api).
+#
+# Two networks, because the plant has two:
+#   uplink     what the site agent uses to reach the backend ("the internet")
+#   plant_lan  the readers and the agent, 10.107.0.0/24 - the readers never see the backend
+# "Cutting the internet" is disconnecting the agent from `uplink`; the LAN stays up.
+#
+# Driven by rehearsal.py, which writes the .env this file reads. Not meant to be run by hand.
+name: havenz_rehearsal
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${REHEARSAL_DB_PASSWORD}
+      POSTGRES_DB: havenzhub
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # The backend checkout's schema and migrations, read-only, for `rehearsal.py up` to apply.
+      - ${REHEARSAL_BMS_PATH}/DataAccess/database:/bms/DataAccess/database:ro
+      - ${REHEARSAL_BMS_PATH}/scripts:/bms/scripts:ro
+    networks: [uplink]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d havenzhub"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ${REHEARSAL_BMS_PATH}
+      dockerfile: Dockerfile
+    image: havenz_rehearsal-api
+    env_file:
+      - ${REHEARSAL_STACK_DIR}/api.env
+    ports:
+      - "127.0.0.1:5100:80"
+    volumes:
+      - api_keys:/keys
+      # The private certificate authority and the stand-in service account the sink generated.
+      - trust:/gcs:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      sink:
+        condition: service_healthy
+    networks: [uplink]
+    # "Never production", enforced by name resolution rather than by trusting configuration:
+    # Google's storage and token hosts resolve to the local sink (which answers as the documents
+    # bucket), and every production or third-party host this code base knows resolves to nowhere.
+    extra_hosts:
+      - "storage.googleapis.com:10.108.0.5"
+      - "oauth2.googleapis.com:10.108.0.5"
+      - "www.googleapis.com:10.108.0.5"
+      - "havenz-backend-599129251048.us-central1.run.app:127.0.0.1"
+      - "havenz-ai-599129251048.us-central1.run.app:127.0.0.1"
+      - "havenz-hub-alb-1643043484.us-east-1.elb.amazonaws.com:127.0.0.1"
+      - "smtp.gmail.com:127.0.0.1"
+      - "fcm.googleapis.com:127.0.0.1"
+      - "api.sendgrid.com:127.0.0.1"
+
+  # Mail goes here and nowhere else (SMTP 1026, read API 8026). It also swallows the backend's
+  # outbound webhooks and stands in for the documents bucket, so face photos stay on this machine.
+  sink:
+    build:
+      context: .
+      dockerfile: docker/sink.Dockerfile
+    ports:
+      - "127.0.0.1:1026:1026"
+      - "127.0.0.1:8026:8026"
+    volumes:
+      - trust:/trust
+    networks:
+      uplink:
+        ipv4_address: 10.108.0.5
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /trust/sa.json && wget -q -O /dev/null http://127.0.0.1:8026/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Twenty readers in one container, each on its own LAN address answering on port 80 like the
+  # hardware. NET_ADMIN is only for adding those twenty addresses to the container's interface.
+  readers:
+    build:
+      context: ..
+      dockerfile: plant-rehearsal/docker/readers.Dockerfile
+    cap_add: [NET_ADMIN]
+    environment:
+      READER_COUNT: "20"
+      READER_SUBNET: "10.107.0"
+      READER_FIRST_HOST: "11"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "127.0.0.1:9100:9100"
+    networks:
+      plant_lan:
+        ipv4_address: 10.107.0.10
+
+  # The real site agent, built from the add-on's own Dockerfile and started by its own entry
+  # point. Only the Home Assistant Supervisor is stood in for: /data/options.json is written by
+  # rehearsal.py instead of by the add-on options page, and the pairing page is reached on a
+  # published port instead of through ingress.
+  agent:
+    build:
+      context: ../../havenz-agent
+      dockerfile: Dockerfile
+      args:
+        BUILD_FROM: ${REHEARSAL_AGENT_BASE:-ghcr.io/home-assistant/amd64-base:3.21}
+    volumes:
+      - ${REHEARSAL_STACK_DIR}/agent-data:/data
+    ports:
+      - "127.0.0.1:8199:8099"
+    networks:
+      uplink: {}
+      plant_lan:
+        ipv4_address: 10.107.0.2
+
+volumes:
+  db_data:
+  api_keys:
+  trust:
+
+networks:
+  uplink:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.108.0.0/24
+          gateway: 10.108.0.1
+          # Leaves .5 free for the sink's fixed address.
+          ip_range: 10.108.0.128/25
+  plant_lan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.107.0.0/24
+          gateway: 10.107.0.1
+          # Docker hands out addresses only from here, so .11-.30 stay free for the readers.
+          ip_range: 10.107.0.240/28

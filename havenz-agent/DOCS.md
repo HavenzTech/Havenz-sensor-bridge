@@ -34,10 +34,63 @@ That is the whole install. One code, once, for the whole site — not one per do
 | `heartbeat_interval_seconds` | `30` | How often the agent reports in. Havenz raises an alert if it goes quiet. |
 | `discovery_enabled` | `false` | Lets the agent look for door readers on this network so nobody has to type in twenty IP addresses. Off by default — see below. |
 
-The agent also keeps a small record at `/data/executed.json` of the work it has already carried
+The agent also keeps a small record at `/data/executed.jsonl` of the work it has already carried
 out, so that restarting it — for an update, after a power cut — cannot make it repeat a door it
 has already opened. It holds about a week, prunes itself, and needs no attention. Deleting it is
-harmless but pointless; the only thing it costs you is that protection for a few minutes.
+harmless but pointless; the only thing it costs you is that protection for a few minutes. (Up to
+0.5.0 this was `/data/executed.json`; the first start of 0.6.0 takes its contents over and removes
+it.)
+
+### Twenty doors on one agent (0.6.0)
+
+Four changes, all found by rehearsing a whole plant - twenty readers, sixty people - on one agent.
+Nothing to configure, and nothing changes at the doors.
+
+**One door that stops answering no longer holds up the others.** The agent used to collect a batch
+of work, finish all of it, and only then ask Havenz for more. A reader that accepted a connection
+and then said nothing kept it waiting ten seconds, and in that time a remote unlock for any other
+door simply sat in Havenz. Now each reader has its own worker and the agent keeps asking for work
+while they are busy. In the rehearsal a healthy door beside a hanging one took 9 seconds to open
+remotely; that is what this removes. A reader that fails three times running is still set aside for
+a minute and re-tried by itself, as before.
+
+**The result of finished work is kept until Havenz has it.** When the agent told Havenz "done" and
+Havenz was busy or briefly unreachable, the answer used to be logged and thrown away, and Havenz
+then showed the command as "unknown" although the reader had done it. Results now wait in
+`/data/results.jsonl` and are sent again - after the pause Havenz asks for, or with a growing pause
+if the connection is down - until Havenz has them, including across a restart of the add-on. The
+status panel shows "N result(s) waiting to be sent" while there are any. A result is given up on
+only if Havenz says the command is not this agent's, or after a day; the log says so and the panel
+counts it. (The result of a *read*, such as collecting a reader's log, is retried for ten minutes
+but not written to disk: Havenz simply reads again.)
+
+**The record of finished work is added to, not rewritten.** `/data/executed.jsonl` now grows by one
+line per command. It used to be one file written out in full after every command, which after a
+day's enrolment took a few tenths of a second each time - time the app spent waiting after a door
+had already opened, and that every enrolment paid for every person on every door. For a door
+unlock the line is still safely on disk before Havenz is told the door opened; for everything else
+(which is harmless to repeat) it is written at once and made safe within a second. The file is
+tidied up in the background when it has grown.
+
+**A reader is always answered within three seconds.** Reader events are still written to
+`/data/events.jsonl` before the reader is told "got it", but they are now written in batches -
+twenty doors reporting in the same second share one disk write instead of queueing for one each -
+so a slow moment on the storage no longer makes the last reader in the queue wait past its own
+five-second limit. One deliberate trade goes with this: if the disk has not confirmed an event
+after three seconds, the agent answers the reader anyway. At that point the event is in the agent's
+memory, is already being sent to Havenz, and is still on its way to the disk; it could only be lost
+if the agent stopped in that same moment, and even then it is still in the reader's own log, which
+Havenz collects every thirty seconds. We chose that over making a reader wait, because what a
+reader does when its report times out is not something anyone has been able to observe. It should
+essentially never happen on healthy storage; if it does, the log says so and `status.json` counts it
+(`answered_before_durable`) - a sign the box's storage needs looking at.
+
+The agent also now waits exactly as long as Havenz asks when it is told "too many requests", for
+its check-ins, its requests for work and its event reports, instead of guessing.
+
+Works with an older Havenz backend. A newer backend gives an agent an allowance sized for the
+number of doors it serves; with an older one the agent may be asked to slow down while a whole
+roster is being enrolled, and from 0.6.0 that costs time but no longer loses anything.
 
 ### Door events are kept until Havenz has them (0.5.0)
 

@@ -123,10 +123,11 @@ def test_the_executed_set_is_written_to_disk(cfg, executed, monkeypatch):
 
     agent.handle(cfg, open_door("command-a", intent_id="tap-1"))
 
-    stored = json.loads(Path(cfg["executed_store_path"]).read_text(encoding="utf-8"))
-    assert stored["version"] == agent.EXECUTED_STORE_VERSION
-    keys = {e["key"] for e in stored["entries"]}
-    assert keys == {"command-a", "tap-1"}, "both the delivery and the intent have to survive"
+    # One line in the journal per piece of work (0.6.0); it used to be one JSON file rewritten whole.
+    lines = [json.loads(line) for line in
+             Path(agent.executed_store_path(cfg)).read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 1 and lines[0]["v"] == agent.EXECUTED_STORE_VERSION
+    assert set(lines[0]["keys"]) == {"command-a", "tap-1"}, "both the delivery and the intent have to survive"
 
 
 def test_a_restart_does_not_reopen_a_door_the_agent_already_opened(cfg, executed, monkeypatch):
@@ -172,13 +173,10 @@ def test_a_store_from_a_future_version_is_ignored_rather_than_misread(cfg):
 def test_entries_older_than_a_week_are_dropped_on_load(cfg):
     import time
     old = time.time() - agent.EXECUTED_TTL_SECONDS - 60
-    Path(cfg["executed_store_path"]).write_text(json.dumps({
-        "version": agent.EXECUTED_STORE_VERSION,
-        "entries": [
-            {"key": "ancient", "at": old, "result": None},
-            {"key": "recent", "at": time.time(), "result": {"opened": True}},
-        ],
-    }), encoding="utf-8")
+    Path(agent.executed_store_path(cfg)).write_text("".join(json.dumps(line) + "\n" for line in [
+        {"v": agent.EXECUTED_STORE_VERSION, "keys": ["ancient"], "at": old, "result": None},
+        {"v": agent.EXECUTED_STORE_VERSION, "keys": ["recent"], "at": time.time(), "result": {"opened": True}},
+    ]), encoding="utf-8")
 
     assert agent.executed_store_load(cfg) == 1
     assert agent._already_executed(None, "recent")[1] == "intent"
@@ -196,8 +194,13 @@ def test_the_set_is_capped_and_keeps_the_newest(cfg, monkeypatch):
         assert "command-24" in agent._executed
         assert "command-0" not in agent._executed
 
-    stored = json.loads(Path(cfg["executed_store_path"]).read_text(encoding="utf-8"))
-    assert len(stored["entries"]) == 10, "the file is bounded too, not just the memory"
+    # The journal is cut back to what is remembered whenever it is compacted - at every start,
+    # and in the background once it has grown (see test_throughput.py for that half).
+    agent._executed.clear()
+    assert agent.executed_store_load(cfg) == 10
+    lines = Path(agent.executed_store_path(cfg)).read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 10, "the file is bounded too, not just the memory"
+    assert agent._already_executed("command-24", None)[1] == "command"
 
 
 def test_a_store_that_cannot_be_written_does_not_fail_the_command(cfg, executed, monkeypatch, tmp_path):
@@ -223,5 +226,6 @@ def test_the_store_path_defaults_to_the_addons_persistent_volume(tmp_path):
 
     loaded = agent.load_config(str(path))
 
-    assert loaded["executed_store_path"] == "/data/executed.json", (
+    assert loaded["executed_store_path"] == "/data/executed.jsonl", (
         "/data is the add-on's own volume — anywhere else is lost on an update")
+    assert loaded["result_outbox_path"] == "/data/results.jsonl"

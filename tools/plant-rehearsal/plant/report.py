@@ -1,5 +1,6 @@
 """Builds REPORT.md and findings.md from a run's results. Reads only; safe to run again at any time."""
 
+import re
 from pathlib import Path
 
 from . import config, findings as findings_mod, plantdef, record, stack
@@ -84,6 +85,16 @@ def metric(scenario, name):
     return f"{fmt(m['value'])} {m['unit']}".strip()
 
 
+def agent_version():
+    """The add-on version the stack built, read from havenz-agent/config.yaml (was a hard-coded string)."""
+    try:
+        text = (config.REPO_DIR / "havenz-agent" / "config.yaml").read_text(encoding="utf-8")
+        m = re.search(r'^version:\s*"?([^"\r\n]+)"?\s*$', text, re.M)
+        return m.group(1).strip() if m else "?"
+    except OSError:
+        return "?"
+
+
 def build(run_dir=None):
     run_dir = record.current_run_dir(run_dir)
     results = record.load_json(Path(run_dir) / "results.json", {"scenarios": {}})
@@ -109,7 +120,7 @@ def build(run_dir=None):
     w("|---|---|")
     w(f"| Backend (HavenzBMS) | `{backend.get('branch', '?')}` at `{str(backend.get('commit', '?'))[:7]}`, "
       f"{backend.get('migrations', '?')} migration files up to `{backend.get('highestMigration', '?')}`, built as the production image |")
-    w("| Site agent | the add-on in this repository (`havenz-agent`, version 0.5.0), from its own Dockerfile |")
+    w(f"| Site agent | the add-on in this repository (`havenz-agent`, version {agent_version()}), from its own Dockerfile |")
     w(f"| Wall app | `{str((apps.get('dashboards') or {}).get('commit', 'not started'))[:7]}`, production build |")
     w(f"| Door panel page | `{str((apps.get('door') or {}).get('commit', 'not started'))[:7]}` |")
     w(f"| Plant | {len(world.get('terminals', []))} readers, {len(world.get('screens', []))} screens, "

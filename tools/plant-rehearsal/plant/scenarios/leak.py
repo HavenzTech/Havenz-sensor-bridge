@@ -98,8 +98,11 @@ def run(ctx, rec):
         rows = ctx.deliveries(found[0]["id"])
         opened = [d for d in rows if d["event"] == "opened"]
         pushes = [d for d in opened if d["channel"] == "push"]
+        # One push row per recipient. With no push provider configured the backend records the
+        # row 'skipped' (HavenzBMS #234, the F-PUSH-SAID-SENT fix); 'sent' is what a real provider
+        # that accepted it would leave. Either is one honest row; anything else is not.
         rec.check("push is recorded once per recipient (it goes nowhere in a rehearsal)",
-                  len(pushes) == len(recipients) and all(d["status"] == "sent" for d in pushes),
+                  len(pushes) == len(recipients) and all(d["status"] in ("sent", "skipped") for d in pushes),
                   f"{len(pushes)} push rows, statuses {[d['status'] for d in pushes]}; "
                   f"{len([d for d in opened if d['channel'] == 'email'])} email rows")
         reached = stack.psql_scalar("select count(*) from notifications.notifications where reference_id = "

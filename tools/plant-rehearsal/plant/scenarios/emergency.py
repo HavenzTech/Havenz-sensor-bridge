@@ -160,11 +160,18 @@ def run(ctx, rec):
     row, _ = wait_until(area_counted, 30, 2.0)
     final = row or scope_row(showing(ctx), "area", area_id)
     in_scope = {s["label"] for s in (final or {}).get("screens", [])}
-    expected_scope = set(panels_in_area) | {corridor.label}
-    rec.check("the area's 'N of M' is made up of exactly the screens in that area",
+    # Only a paired screen can be in scope: the panels are paired by the screen half (real
+    # browsers), which does not always run alongside this half. Expect the paired ones.
+    _, listed = ctx.api.get("/api/havenzhub/screens", expect=200)
+    paired_ids = {s["id"] for s in listed if s.get("keyStatus") == "paired"}
+    unpaired = [s["name"] for s in ctx.world["screens"]
+                if s["kind"] == "door" and s.get("areaKey") == area_key and s["id"] not in paired_ids]
+    expected_scope = (set(panels_in_area) - set(unpaired)) | {corridor.label}
+    rec.check("the area's 'N of M' is made up of exactly the paired screens in that area",
               bool(final) and in_scope == expected_scope,
               f"in scope: {sorted(in_scope)}" + ("" if in_scope == expected_scope
-                                                  else f"; expected {sorted(expected_scope)}"))
+                                                  else f"; expected {sorted(expected_scope)}")
+              + (f"; {len(unpaired)} panel(s) in the area not paired (screen half not run): {unpaired}" if unpaired else ""))
     rec.metric(f"screens showing the {area_name} evacuation", n_of_m(final), "")
 
     # ---- 4. one screen in the area is off when the all-clear goes out ------------------------------

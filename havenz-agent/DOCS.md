@@ -41,6 +41,22 @@ harmless but pointless; the only thing it costs you is that protection for a few
 0.5.0 this was `/data/executed.json`; the first start of 0.6.0 takes its contents over and removes
 it.)
 
+### A password corrected in Zhub reaches the reader without a restart (0.6.1)
+
+The agent asks Havenz for each reader's username and password once and keeps them, because a
+remote unlock has no time to fetch them from the cloud first. Until 0.6.0 that was also the only
+time it asked: a reader claimed with the wrong password, and then corrected in Zhub, kept failing
+with "login rejected: HTTP 401" until the add-on was restarted. Found on the first home bench.
+
+Now, when a reader refuses the login it holds, the agent asks Havenz again for the roster, and if
+Havenz has newer credentials for that reader it retries the command with them straight away. If
+Havenz still holds the same ones, the command fails once with a message saying so (the fix is on the
+terminal's page in Zhub, not a restart), and the agent does not ask Havenz again for fifteen
+seconds, so twenty doors with a wrong password cannot flood it. Readers whose credentials did not
+change keep their logged-in session; correcting one door never logs the others out. Havenz can also
+say in its heartbeat when it last changed a reader's credentials, and the agent then reloads that
+reader before the next command fails rather than after.
+
 ### Twenty doors on one agent (0.6.0)
 
 Four changes, all found by rehearsing a whole plant - twenty readers, sixty people - on one agent.

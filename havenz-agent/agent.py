@@ -92,7 +92,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.6.1"
 
 # How far our clock may differ from the backend's before we say so.
 #
@@ -237,6 +237,18 @@ class ReaderError(Exception):
     """The reader refused, or could not be reached. Carries the reader's own words."""
 
 
+class ReaderLoginRejected(ReaderError):
+    """
+    The reader refused the credentials themselves: HTTP 401 or 403 from its login endpoint.
+
+    Kept apart from a session that merely expired, which Reader.call() repairs silently, because
+    the remedy is different. A rejected login means the password this agent holds is not the one on
+    the reader, and the only place a newer one can come from is Havenz. Seen on the first home
+    bench: a reader claimed with the wrong password, corrected in Zhub, and every command still
+    failing until the add-on was restarted.
+    """
+
+
 class ReaderOutcomeUnknown(ReaderError):
     """
     The request went to the reader and no answer came back.
@@ -289,7 +301,8 @@ class Reader:
       - numbers come back quoted
     """
 
-    def __init__(self, terminal_id, name, ip, username, password, timeout=10):
+    def __init__(self, terminal_id, name, ip, username, password, timeout=10,
+                 credentials_updated_at=None):
         self.terminal_id = terminal_id
         self.name = name
         # May carry a port ("10.0.0.250:8080"). Real readers answer on 80, but a site behind a
@@ -301,6 +314,15 @@ class Reader:
         self._password = password
         self._timeout = timeout
         self._session = None
+        # When Havenz last changed these credentials, as Havenz stamps it. Compared with the stamp
+        # in each heartbeat so a correction made in Zhub is picked up before the next command
+        # fails, not after. None when the backend does not send one; then the 401 path below is
+        # the only trigger.
+        self.credentials_updated_at = credentials_updated_at
+
+    def holds(self, ip, username, password):
+        """True if this client was built from exactly this address and these credentials."""
+        return (self.ip, self._username, self._password) == (ip, username, password)
 
     def _login(self):
         body = json.dumps({"login": self._username, "password": self._password}).encode("utf-8")
@@ -311,9 +333,12 @@ class Reader:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            raise ReaderError(
-                f"login rejected by {self.ip}: HTTP {e.code} "
-                f"{e.read().decode('utf-8', 'replace')[:160]}") from None
+            detail = e.read().decode("utf-8", "replace")[:160]
+            if e.code in (401, 403):
+                raise ReaderLoginRejected(
+                    f"login rejected by {self.ip}: HTTP {e.code} {detail} - the reader does not "
+                    f"accept the username/password held for it") from None
+            raise ReaderError(f"login rejected by {self.ip}: HTTP {e.code} {detail}") from None
         except Exception as e:  # noqa: BLE001
             raise ReaderError(f"cannot reach {self.ip}: {e}") from None
 
@@ -770,6 +795,23 @@ def heartbeat(cfg):
             held.pop(terminal["id"], None)
             breaker_record(terminal["id"], True, reader.name)   # its old address failing is not its fault
             STATE["readers"] = {}                               # refetched, with credentials, on next use
+            continue
+
+        # Credentials corrected in Zhub.
+        #
+        # Same shape as the address: the heartbeat says when Havenz last changed them, and holding
+        # a password Havenz has since replaced means every command fails with "login rejected"
+        # until something refetches. Readers whose stamp we never learned adopt the first one seen,
+        # so the comparison works against a backend that only sends it in the heartbeat.
+        stamp = terminal.get("credentialsUpdatedAt")
+        if reader and stamp:
+            if reader.credentials_updated_at is None:
+                reader.credentials_updated_at = stamp
+            elif stamp != reader.credentials_updated_at:
+                log.info("credentials for reader %s were changed in Havenz — reloading it", reader.name)
+                held.pop(terminal["id"], None)
+                breaker_record(terminal["id"], True, reader.name)   # the old password failing is not its fault
+                STATE["readers"] = {}
 
     server_epoch = parse_server_time(data.get("serverTimeUtc"))
     if server_epoch is not None:
@@ -1464,15 +1506,50 @@ def readers_for(cfg, force=False):
         if held and (not force or _readers_fetched["at"] >= asked):
             return held
         rows = backend_get(cfg, "/api/agent/terminals")
-        held = {
-            r["id"]: Reader(r["id"], r.get("name", "?"), r["ipAddress"], r["username"], r["password"])
-            for r in rows
-        }
+        previous = STATE.get("readers") or {}
+        held = {}
+        replaced = 0
+        for r in rows:
+            kept = previous.get(r["id"])
+            # A reader whose address and credentials have not changed keeps its client, and with
+            # it the session it has already logged in with. Correcting one door's password must
+            # not log the other nineteen out.
+            if kept is not None and kept.holds(r["ipAddress"], r["username"], r["password"]):
+                held[r["id"]] = kept
+                continue
+            replaced += kept is not None
+            held[r["id"]] = Reader(r["id"], r.get("name", "?"), r["ipAddress"], r["username"],
+                                   r["password"], credentials_updated_at=r.get("credentialsUpdatedAt"))
         STATE["readers"] = held
         _readers_fetched["at"] = time.monotonic()
-        log.info("hold credentials for %d reader(s)", len(held))
+        log.info("hold credentials for %d reader(s)%s", len(held),
+                 f" ({replaced} with new address or credentials)" if replaced else "")
         roster_save(cfg, {r.host: tid for tid, r in held.items()})
         return held
+
+
+# A reader that rejects its login makes the agent ask Havenz for the roster again, in case the
+# credentials were corrected there - but not more often than this. Twenty doors claimed with a
+# wrong password would otherwise turn every poll cycle into twenty roster fetches, for an answer
+# that cannot have changed in the seconds since the last one.
+CREDENTIAL_REFETCH_MIN_SECONDS = 15
+
+
+def _reader_with_fresh_credentials(cfg, reader):
+    """
+    After a reader rejected the credentials we hold, ask Havenz whether it has newer ones.
+
+    Returns a client built on the newer credentials, or None when Havenz holds the same ones (or
+    was asked moments ago, which amounts to the same thing).
+    """
+    if time.monotonic() - _readers_fetched["at"] < CREDENTIAL_REFETCH_MIN_SECONDS:
+        return None
+    fresh = readers_for(cfg, force=True).get(reader.terminal_id)
+    # readers_for keeps the same client when nothing about a reader changed, so identity is the
+    # test for "Havenz still says what we already tried".
+    if fresh is None or fresh is reader:
+        return None
+    return fresh
 
 
 def execute(cfg, command):
@@ -1488,6 +1565,24 @@ def execute(cfg, command):
     if reader is None:
         raise ReaderError(f"no credentials held for terminal {terminal_id}")
 
+    try:
+        return _perform(cfg, reader, kind, payload)
+    except ReaderLoginRejected as rejected:
+        # The password on the reader is not the one we hold. If Havenz has a newer one - corrected
+        # in Zhub since we last asked - use it now, so the fix lands without a restart of the
+        # add-on. If Havenz holds the same one, say so: the fix is in Zhub, not here.
+        fresh = _reader_with_fresh_credentials(cfg, reader)
+        if fresh is None:
+            raise ReaderError(
+                f"{rejected}; Havenz holds the same credentials, so they need correcting on the "
+                f"terminal in Zhub") from None
+        log.info("terminal %s rejected the held login and Havenz has newer credentials for it; "
+                 "retrying %s with those", reader.name, kind)
+        return _perform(cfg, fresh, kind, payload)
+
+
+def _perform(cfg, reader, kind, payload):
+    """One command against one reader client. Raises ReaderError and its kinds."""
     if kind == "GetSystemInfo":
         return reader.system_info()
     if kind == "OpenDoor":
